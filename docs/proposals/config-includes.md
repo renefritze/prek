@@ -1317,6 +1317,106 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | Git include reads files outside its checkout | Tests 114 and 127. |
 | Git includes change hook repository clone behavior | Tests 121 and 132, plus the existing clone and `try-repo` suites passing unchanged. |
 
+## Delivery plan
+
+The implementation lands as five PRs. Each one works on its own and brings its
+own tests and docs, so it can ship in a release without the ones after it.
+
+| PR | Scope | Depends on | Size |
+| -- | -- | -- | -- |
+| 1 | Section-aware `rev` mapping in `prek update` | none | about 1 day |
+| 2 | `includes` key, full entry syntax, local includes | none | 3 to 4 days |
+| 3 | Git includes | 2 | about 2 days |
+| 4 | `prek update` for Git include `rev`s | 1, 3 | about 1 day |
+| 5 | HTTPS includes, cache, and pinning | 2 | 3 to 4 days |
+
+PRs 1 and 2 can be developed in parallel. PR 5 only needs PR 2, so it can
+proceed alongside PRs 3 and 4. Git includes come before HTTPS includes because
+they are cheaper, reuse the existing clone store, and already cover private
+configuration.
+
+### PR 1: section-aware `rev` mapping
+
+A refactor of `crates/prek/src/cli/update/` with no behavior change, as
+described in [Update rewriting](#update-rewriting): `RevSlot`,
+`ConfigRevisions`, and section-aware `read_frozen_refs`,
+`render_updated_yaml_config`, and `render_updated_toml_config`. It lands before
+any include support so the refactor can be reviewed against unchanged output.
+
+- Tests: 137 to 147. The rewriting functions work on file text, so these tests
+  do not need `includes` parsing.
+- Guard: every existing `tests/update.rs` snapshot stays byte-identical.
+
+### PR 2: `includes` and local includes
+
+- The `includes` key and the full entry syntax for all three source kinds, with
+  every parse-time rule in [Include entries](#include-entries),
+  [Remote URL rules](#remote-url-rules), and
+  [Git include rules](#git-include-rules).
+- Resolution of local includes only. A `url` or `repo` entry that parses fails
+  at resolution with a hard error saying that the source kind is not supported
+  yet. It is never warned about and skipped, because skipping would silently
+  drop hooks.
+- The included file format, merge semantics, per-file priorities, collision
+  checks, the error model, the staged-config check, and the command behavior
+  for local includes: `run`, `list`, `exec`, `prepare-hooks`,
+  `validate-config`, completion, the meta hooks, `yaml-to-toml`, and cache GC
+  for repositories referenced by local includes.
+- The `prek.schema.json` update and the reference, compatibility, and cookbook
+  docs for local includes.
+- Tests:
+  - unit tests 1 to 40 and 110 to 117,
+  - integration tests 63, 64, 66, 68, 69, 71 to 75, 77 to 83, 87 to 90, 92,
+    and 100 to 109,
+  - the local parts of 99,
+  - a temporary `unsupported_include_source_is_error` test, which PRs 3 and 5
+    replace with their positive tests,
+  - `yaml_to_toml_converts_includes`, and the local part of
+    `completion_offers_included_hook_ids`.
+
+### PR 3: Git includes
+
+- [Git includes](#git-includes): cloning through `Store::clone_repos`, reading
+  `path`, the resolution matrix, the `GitInclude` source, cache GC marking of
+  include clones, and the Git parts of the security docs.
+- Tests:
+  - unit tests 118 to 122,
+  - integration tests 123 to 135,
+  - `cache_gc_keeps_git_include_clone` and
+    `cache_gc_removes_git_include_clone_after_removal`,
+  - the Git part of `completion_offers_included_hook_ids`,
+  - the regression rows for checkout escapes and hook repository clones.
+
+### PR 4: `prek update` for Git includes
+
+- [`prek update` and Git includes](#prek-update-and-git-includes):
+  `UpdateRequirement`, `checkout_and_validate_include`, Git include targets,
+  repository selectors, and output labels. The rewriting side is already in
+  place from PR 1.
+- Tests: 136 and 148 to 163.
+
+### PR 5: HTTPS includes
+
+- [Remote includes](#remote-includes): fetching, the cache layout and atomic
+  writes, freshness, `--refresh`, conditional requests, `sha256` pinning, the
+  size limit, the `RemoteInclude` source, `PREK_INCLUDE_CACHE_TTL`, cache GC
+  for include entries and blobs, and the HTTPS parts of the security docs.
+- The `TestHttpServer` helper in `tests/common/mod.rs`.
+- Tests:
+  - unit tests 41 to 62,
+  - integration tests 65, 67, 70, 76, 84 to 86, 91, and 93 to 98,
+  - the remote parts of 99,
+  - the include-cache tests in `tests/cache.rs`, and the remote part of
+    `completion_offers_included_hook_ids`.
+
+### Releases between PRs
+
+If a release ships before every source kind is supported, a config that uses
+an unsupported kind fails with the "not supported yet" error from PR 2. The
+reference docs name the first `prek` version for each source kind, and
+recommend setting `minimum_prek_version` to it, so that older versions fail
+early with the version message instead.
+
 ## Documentation
 
 - `docs/reference/configuration.md`: a new "`includes`" section under top-level
