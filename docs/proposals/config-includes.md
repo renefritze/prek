@@ -51,7 +51,9 @@ the result as one project configuration.
 - Authentication for private HTTPS includes. Private sources are supported
   through [Git includes](#git-includes), which use the user's Git credentials.
 - Includes in hook manifests (`.pre-commit-hooks.yaml`).
-- Rewriting included files with `prek update`.
+- Rewriting included files with `prek update`. `prek update` does bump the
+  `rev` of Git includes, because that value lives in the main config. See
+  [`prek update` and Git includes](#prek-update-and-git-includes).
 - Top-level settings in included files, such as `default_stages` or `exclude`.
   Only the main configuration controls project-wide behavior.
 
@@ -539,6 +541,8 @@ is never fetched again. Git includes inherit that behavior:
 - `--refresh` does not re-clone, again matching hook repositories.
   `prek cache clean` drops every clone.
 - There is no TTL, no conditional request, and no stale fallback.
+- A Git include moves forward by changing its `rev`, by hand or with
+  `prek update`. The change shows up in review like any other `rev` bump.
 
 ### Resolution matrix for Git includes
 
@@ -556,6 +560,53 @@ Error format for a missing path:
 error: Included configuration `go.yaml` was not found in `https://github.com/org/prek-shared` at `v1.4.0`
 hint: Check the `path`, or choose a `rev` that contains it.
 ```
+
+### `prek update` and Git includes
+
+`prek update` bumps the `rev` of every Git include in the main config, with the
+same rules it applies to hook repositories. The `rev` lives in the main config,
+so this does not rewrite included files.
+
+**Selection.** A Git include goes through the same `select_update_revision`
+path as a hook repository:
+
+- It picks the newest tag that passes the tag filters: `--include-tag`,
+  `--exclude-tag`, `--repo-include-tag`, `--repo-exclude-tag`, and the
+  project's `update.repos.<repo>` settings, resolved with
+  `UpdateSettings::resolve` and keyed by the include's `repo` value.
+- Cooldowns apply, and a cooldown never downgrades.
+- `--bleeding-edge` moves to the tip of the default branch.
+- `--freeze` writes the commit SHA and a `# frozen: <tag>` comment on the
+  include's `rev` line. Stale `# frozen:` comments are reported with the
+  existing frozen-mismatch warnings.
+- `--repo` and `--exclude-repo` match Git include repositories. Checks for
+  unknown `--repo` values, `--repo-include-tag`/`--repo-exclude-tag` keys, and
+  `update.repos` entries count Git include repositories as configured.
+
+**Validation.** A hook repository candidate is accepted only if the
+repository's manifest still has every configured hook id
+(`checkout_and_validate_manifest`). A Git include candidate is accepted only if
+`path` exists at the candidate revision, is a regular file, and parses and
+validates as an included file with the same code used during resolution. If
+validation fails, that target fails: the error is shown like a manifest
+validation failure, the `rev` is left unchanged, and the command exits with a
+failure status, as it does for hook repositories today. The updater does not
+try an older tag instead.
+
+**Sharing.** A Git include and a hook repository with the same source share one
+fetch, because they are grouped into one `RepoSource`. They are separate
+targets, because a hook repository has to keep its hook ids and an include has
+to keep its file.
+
+**Output.** Git includes use the same update, up-to-date, skipped-downgrade, and
+failure lines as hook repositories. The label adds the include path:
+
+```text
+[https://github.com/org/prek-shared (include go.yaml)] updating v1.4.0 -> v1.6.0
+```
+
+**Scope.** Only the main config is rewritten. Repositories inside included files
+keep their `rev`s, and local include files are never modified.
 
 ## Error model
 
@@ -602,7 +653,7 @@ resolution, so editing one takes effect on the next run without `--refresh`.
 | `prek install --prepare-hooks`, `prek prepare-hooks` | Same as `run`, so hook environments for included hooks are prepared. |
 | `prek install` (shims only) | No resolution. `default_install_hook_types` comes from the main config only. |
 | `prek validate-config` | Resolves includes with network allowed and reports include errors and collisions. It becomes async. |
-| `prek update` | No resolution. Only `repos` in the main config are updated. Included files and Git include `rev`s are never rewritten. |
+| `prek update` | No include resolution. Updates `repos` and Git include `rev`s in the main config, see [`prek update` and Git includes](#prek-update-and-git-includes). Included files are never rewritten. |
 | `prek cache gc` | Cache-only resolution, see below. Never uses the network or clones. |
 | `prek util yaml-to-toml` | Converts `includes` entries, both string and table forms. Included files are not converted or fetched. |
 | `prek try-repo` | Unaffected. The generated config has no includes. |
@@ -789,6 +840,70 @@ two paths cannot drift.
 - `check_hook_collisions(sources: &[(ConfigSource, &[Repo])]) -> Result<(), IncludeError>`
   is a pure function, so it can be unit tested without any I/O.
 
+### Update rewriting
+
+The updater matches `rev` sites to configured entries by position today:
+
+- `collect_repo_sources` bails when the number of `rev` lines found by
+  `read_frozen_refs` differs from the number of remote repositories.
+- `render_updated_yaml_config` bails when the count of `rev:` lines differs.
+- `render_updated_toml_config` walks `[[repos]]`, but the TOML `rev =` regex in
+  `read_frozen_refs` would also count lines in `[[includes]]` tables.
+
+A config with a block-style Git include therefore breaks `prek update` unless
+the mapping changes. This is required even apart from updating includes:
+
+- **YAML:** each `rev:` line belongs to its enclosing top-level key, which is
+  the last column-0 `key:` line before it. Lines under `repos` map to remote
+  repositories in order, and lines under `includes` map to Git includes in
+  order, whichever section comes first in the file.
+- **TOML:** sites are found by structure with `toml_edit`: `[[repos]]` tables,
+  inline tables in `includes = [...]`, and `[[includes]]` tables. The `rev =`
+  detection in `read_frozen_refs` uses the same sections, so frozen comments
+  line up.
+- If the number of `rev` sites under `includes` doesn't match the number of
+  Git includes, for example because of flow-style
+  `- {repo: ..., rev: ..., path: ...}`, the updater warns once that Git include
+  revisions in that file can't be updated, and still updates `repos`. The
+  existing all-or-nothing behavior for `repos` is unchanged.
+
+The types become explicit about which kind of entry they refer to:
+
+```rust
+/// What must still hold at a candidate revision.
+enum UpdateRequirement<'a> {
+    /// The manifest must still define these hook ids.
+    Hooks(Vec<&'a str>),
+    /// This file must exist and be a valid included configuration.
+    IncludeFile(&'a RelativeIncludePath),
+}
+
+/// Which `rev` site in a config file a usage refers to.
+enum RevSlot {
+    Repo(usize),
+    Include(usize),
+}
+
+/// New revisions for one config file, by site kind.
+struct ConfigRevisions {
+    repos: Vec<Option<Revision>>,
+    includes: Vec<Option<Revision>>,
+}
+```
+
+- `RepoTarget.required_hook_ids` becomes `requirement: UpdateRequirement`. It
+  is part of `RepoTargetKey`, so a hook repository and a Git include with the
+  same `repo` and `rev` stay separate targets.
+- `RepoUsage.remote_index` becomes `slot: RevSlot`. `remote_count` becomes
+  per-kind counts.
+- `ProjectUpdates` maps each config file to `ConfigRevisions`, and
+  `write_new_config`, `render_updated_yaml_config`, and
+  `render_updated_toml_config` take `ConfigRevisions`.
+- `evaluate_repo_target` dispatches on `UpdateRequirement`. `Hooks` calls
+  `checkout_and_validate_manifest`, and `IncludeFile` calls a new
+  `checkout_and_validate_include` next to it in `repository.rs`. That function
+  reads the file with `git show <rev>:<path>` and runs the included-file parser.
+
 ### Touched files
 
 - `crates/prek/src/config/mod.rs`: `includes` field, include path resolution,
@@ -807,6 +922,9 @@ two paths cannot drift.
 - `crates/prek/src/cli/completion.rs`: included hook ids.
 - `crates/prek/src/hooks/meta_hooks.rs`: included hooks in meta checks.
 - `crates/prek/src/cli/yaml_to_toml.rs`: `includes` conversion.
+- `crates/prek/src/cli/update/{mod,source,config,repository,display}.rs`:
+  section-aware `rev` mapping, Git include targets, include validation, and
+  include labels in output.
 - `crates/prek-consts/src/env_vars.rs`: `PREK_INCLUDE_CACHE_TTL`.
 - `prek.schema.json`: regenerated with `PREK_GENERATE=1`.
 - Docs: see [Documentation](#documentation).
@@ -1097,8 +1215,69 @@ local Git repository that works as a `repo:` source, so no server is needed.
 134. `git_include_toml_file`: TOML chosen by the extension of `path`.
 135. `validate_config_with_git_include`: valid, missing path, and clone
      failure.
-136. `update_ignores_git_include_rev`: `prek update` leaves the include `rev`
-     unchanged.
+136. `update_bumps_git_include_rev`: `prek update` moves the include `rev` to
+     the newest tag, and the include file in the source repository is not
+     touched.
+
+### Unit tests: `prek update` and Git includes
+
+In `cli/update/config.rs`:
+
+137. `yaml_rev_sites_includes_before_repos`: each `rev:` line maps to the right
+     entry.
+138. `yaml_rev_sites_includes_after_repos`.
+139. `yaml_rev_sites_git_includes_only`: no remote repositories.
+140. `yaml_rev_sites_ignore_non_git_includes`: string, local, and remote entries
+     next to one Git include, and only its line counts.
+141. `yaml_flow_style_git_include_skipped`: the result says include revisions
+     can't be updated, and repository revisions are still rewritten.
+142. `yaml_include_rev_keeps_quotes_and_comment`: quote style and a trailing
+     non-frozen comment are kept.
+143. `yaml_include_rev_frozen_comment_spacing`: an existing `# frozen:` spacing
+     is kept, and the default spacing is used for a new one.
+144. `toml_rev_sites_inline_includes`.
+145. `toml_rev_sites_array_of_tables_includes`: `[[includes]]`.
+146. `toml_include_rev_frozen_comment`.
+147. `read_frozen_refs_is_section_aware`: YAML and TOML with `rev` sites in both
+     sections.
+
+In `cli/update/source.rs` and `cli/update/repository.rs`:
+
+148. `hook_repo_and_git_include_share_repo_source`: one `RepoSource` and two
+     targets.
+149. `git_include_uses_repo_update_settings`: `update.repos.<repo>` cooldown and
+     tag filters apply.
+150. `checkout_and_validate_include_missing_path`: the candidate is rejected.
+151. `checkout_and_validate_include_invalid_file`: a forbidden key and a parse
+     error at the candidate tag are rejected.
+152. `checkout_and_validate_include_valid`.
+
+### Integration tests: `prek update` and Git includes
+
+In `crates/prek/tests/update.rs`, using `create_repo` fixtures with several
+tags:
+
+153. `update_git_include_to_latest_tag`: YAML and TOML configs.
+154. `update_git_include_freeze`: writes a SHA and `# frozen: <tag>`.
+155. `update_git_include_cooldown`: a tag inside the cooldown window is skipped,
+     and nothing is downgraded.
+156. `update_git_include_tag_filters`: `--repo-exclude-tag` and project
+     `update.repos` settings.
+157. `update_git_include_repo_selector`: `--repo <include repo>` updates only
+     the include, and `--exclude-repo` skips it.
+158. `update_git_include_bleeding_edge`.
+159. `update_git_include_candidate_missing_path`: the failure is reported, the
+     `rev` is unchanged, and the exit status is failure.
+160. `update_git_include_dry_run`: output snapshot with the include label, and
+     the config is byte-identical afterwards.
+161. `update_hook_repo_and_git_include_same_source`: both are updated in one
+     run, and the source is fetched once.
+162. `update_with_flow_style_git_include`: warning, and repositories are still
+     updated.
+163. `update_workspace_git_includes`: two projects with the same include, each
+     config updated.
+
+Additions to existing test files:
 
 Additions to existing test files:
 
@@ -1130,7 +1309,10 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | Workspace cache hides include edits | Test 78. |
 | Silent pin loss from typos | Test 10. |
 | Stale fallback hides broken upstream | Tests 54 and 98. |
-| `prek update` writes to the wrong file | Test 106. |
+| `prek update` writes to the wrong file | Tests 106 and 136. |
+| A Git include breaks `prek update` rev mapping | Tests 137 to 141, 147, and 162. |
+| `prek update` output changes for configs without includes | Existing `tests/update.rs` snapshots pass unchanged. |
+| `prek update` modifies local include files | Test 106, plus a byte-for-byte check in test 153. |
 | GC deletes caches still in use | The `tests/cache.rs` additions. |
 | Git include reads files outside its checkout | Tests 114 and 127. |
 | Git includes change hook repository clone behavior | Tests 121 and 132, plus the existing clone and `try-repo` suites passing unchanged. |
@@ -1156,9 +1338,8 @@ These guard existing behavior, and each maps to a risk this change introduces:
 - Top-level settings scoped to the hooks of one include.
 - Private HTTPS includes with a token from the environment. Git includes already
   cover private sources.
-- `prek update --includes`, which writes `sha256` pins for remote includes,
-  bumps Git include `rev`s with the existing tag resolution and `--freeze`
-  logic, and bumps `rev`s in local included files.
+- `prek update --includes`, which writes `sha256` pins for HTTPS includes and
+  bumps `rev`s in local included files.
 - A setting that requires every remote include to be pinned.
 - Include sources in `prek list --output-format=json`.
 - Nested includes, with cycle detection.
