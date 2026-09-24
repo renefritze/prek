@@ -1,0 +1,995 @@
+# Configuration includes
+
+This document specifies `includes`, a way for a project configuration to pull
+hook definitions from other configuration files. An include can be a local file
+or a remote file fetched over HTTPS. Remote includes are cached, and they can be
+pinned to a SHA-256 digest of their content.
+
+Tracking issue: [j178/prek#1238](https://github.com/j178/prek/issues/1238).
+The design follows the direction discussed in
+[this comment](https://github.com/j178/prek/issues/1238#issuecomment-3806430461):
+an include names a location and may carry a content digest. In this spec the
+digest is optional.
+
+## Motivation
+
+Organizations with many repositories tend to copy the same hook list into every
+repository. Keeping those copies in sync is manual work: each `rev` bump, new
+hook, or changed argument has to be repeated everywhere, and the copies drift.
+
+Monorepos and multi-package repositories have a smaller version of the same
+problem. Several projects in one workspace often share a baseline such as
+whitespace fixers, a license check, and a secret scanner, and today each project
+config has to repeat it.
+
+Tools in adjacent spaces solve this with includes. Task supports remote
+Taskfiles, GitLab CI has `include:`, and Renovate has shareable presets. `prek`
+should let a configuration say "these hooks come from that file" and then treat
+the result as one project configuration.
+
+## Goals
+
+- Include hook definitions from one or more files, listed in order.
+- Allow local paths and remote HTTPS URLs in the same list.
+- Cache remote includes so ordinary runs work offline and do not pay a network
+  round trip on every commit.
+- Let users pin a remote include to the exact bytes they reviewed, without
+  requiring it.
+- Fail loudly on anything that would change which hooks run in a way the user
+  cannot see: an unreachable include with no cached copy, a digest mismatch, or
+  two sources defining the same hook.
+
+## Non-goals
+
+- Overriding or patching included hooks. The issue mentions "additions or
+  overrides". This spec only supports additions. Two sources defining the same
+  hook is an error, not an override. See [Future work](#future-work).
+- Nested includes. An included file cannot include other files.
+- Authentication for private remote includes.
+- Includes in hook manifests (`.pre-commit-hooks.yaml`).
+- Rewriting included files with `prek update`.
+- Top-level settings in included files, such as `default_stages` or `exclude`.
+  Only the main configuration controls project-wide behavior.
+
+## Configuration
+
+### `includes`
+
+A new optional top-level key, `includes`, is added to the project configuration.
+
+=== ".pre-commit-config.yaml"
+
+    ```yaml
+    includes:
+      - ci/hooks/base.yaml
+      - https://example.com/org/prek/python.yaml
+      - url: https://example.com/org/prek/security.toml
+        sha256: 3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7
+      - path: ../shared/rust.yaml
+
+    repos:
+      - repo: local
+        hooks:
+          - id: project-check
+            name: Project check
+            language: system
+            entry: ./scripts/check.sh
+    ```
+
+=== "prek.toml"
+
+    ```toml
+    includes = [
+      "ci/hooks/base.yaml",
+      "https://example.com/org/prek/python.yaml",
+      { url = "https://example.com/org/prek/security.toml", sha256 = "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7" },
+      { path = "../shared/rust.yaml" },
+    ]
+
+    [[repos]]
+    repo = "local"
+    hooks = [
+      { id = "project-check", name = "Project check", language = "system", entry = "./scripts/check.sh" },
+    ]
+    ```
+
+- **Type**: list of include entries
+- **Default**: empty list
+- **Scope**: the main project configuration only
+- **Order**: significant, see [Hook order](#hook-order)
+
+`includes` is a `prek`-only key. `repos` stays required in the main
+configuration. A configuration that only includes other files writes
+`repos: []`. Keeping `repos` required means existing configurations keep their
+current error messages.
+
+### Include entries
+
+Each entry is either a string or a table.
+
+A string that starts with `https://` or `http://` is a remote include. Any other
+string is a local path. There is no other scheme detection, so a string like
+`file:///etc/x.yaml` or `git+https://...` is rejected instead of being treated
+as a path.
+
+A table has exactly one location key and an optional digest:
+
+| Key | Type | Meaning |
+| -- | -- | -- |
+| `path` | string | Local file path. |
+| `url` | string | Remote URL. |
+| `sha256` | string | Optional. Expected SHA-256 of the remote file's bytes. Only valid with `url`. |
+
+Table rules, all enforced during parsing so errors carry a line and column:
+
+- Exactly one of `path` or `url` is required. Both or neither is an error.
+- `sha256` together with `path` is an error. Local files are already under the
+  user's control, and a digest there would only go stale.
+- Unknown keys in an include table are an error, not a warning. A typo like
+  `sha265` would otherwise disable pinning without any visible sign.
+- `sha256` accepts 64 hex characters, case-insensitive, with an optional
+  `sha256:` prefix. This is the format `Sha256Digest::from_str` already accepts.
+- An empty string, or a table value that is an empty string, is an error.
+
+### Remote URL rules
+
+- The scheme must be `https`. Plain `http` is accepted only when the host is a
+  loopback address (`localhost`, `127.0.0.0/8`, or `::1`). This supports local
+  development servers and the test suite, and it never exposes real traffic to
+  a downgrade.
+- URLs with user info (`https://user:token@host/...`) are rejected. Credentials
+  in a committed config file leak into logs, warnings, and the cache metadata.
+  Private includes are future work.
+- The URL is parsed and normalized with `reqwest::Url`. The normalized form is
+  used as the cache identity and in messages.
+- Redirects are followed with the shared client's policy. If the final URL is
+  plain `http` on a non-loopback host, the fetch fails.
+- The file format is chosen from the extension of the URL path, ignoring the
+  query string and fragment. A `.toml` path is parsed as TOML. Everything else
+  is parsed as YAML. This matches how `load_config` treats local files.
+
+### Local path rules
+
+- Relative paths resolve against the directory of the configuration file that
+  lists them. They do not resolve against the process working directory, the
+  workspace root, or the Git root. This matches how relative `repo:` paths are
+  already resolved.
+- Absolute paths are allowed. A leading `~` is expanded with the existing
+  `fs::expand_tilde`.
+- The path must name a regular file. A missing path or a directory is an error.
+- The file format is chosen by extension, the same way as for the main config.
+- Local includes may live outside the Git repository. Those files are not
+  subject to the staged-config check described in
+  [Command behavior](#command-behavior).
+
+### Duplicate and self includes
+
+These are errors:
+
+- The same local file listed twice, compared after canonicalization, so
+  `./a.yaml` and `a.yaml` count as the same file.
+- The same remote URL listed twice, compared after normalization.
+- A local include that resolves to the main configuration file itself.
+
+Listing the same file twice would make every hook in it collide with itself. The
+error names the duplicate directly instead of reporting confusing hook
+collisions.
+
+## Included file format
+
+An included file uses the same syntax as a project configuration, in YAML or
+TOML, but only a subset of top-level keys is meaningful.
+
+Allowed keys:
+
+| Key | Behavior |
+| -- | -- |
+| `repos` | Required. Same schema as the main config. `repos: []` is valid. |
+| `priorities` | Optional. Priority aliases scoped to this included file. |
+| `minimum_prek_version` | Optional. Enforced exactly as in the main config. |
+| `ci`, `minimum_pre_commit_version` | Ignored silently, as in the main config. |
+| `x-*` | Ignored silently, as in the main config. |
+
+Keys that are known project settings are errors when they appear in an included
+file:
+
+`includes`, `default_install_hook_types`, `default_language_version`,
+`default_stages`, `default_env`, `files`, `exclude`, `fail_fast`, `orphan`,
+`update`.
+
+The reason is that these keys change which files hooks see, which stages they
+run in, or how the whole project behaves. Silently dropping `exclude: ^vendor/`
+from an included file would run its hooks on vendored code. Applying it would
+make one include change the behavior of hooks from other sources. Both
+outcomes are surprising, so the author has to publish a file shaped for
+inclusion. Allowing these keys scoped to the included hooks is listed in
+[Future work](#future-work).
+
+The `includes` key gets its own error message
+(`nested includes are not supported`) because it is the most likely mistake.
+
+Any other unknown key produces the usual unused-key warning. The warning names
+the include source, for example:
+
+```text
+warning: Ignored unexpected keys in `https://example.com/org/prek/python.yaml`: `repo_defaults`
+```
+
+The existing mutable-`rev` warning also applies to remote repositories declared
+in included files, and it names the include source next to each repository.
+
+### Repository paths inside included files
+
+Existing configs may use a local directory as `repo:` (for example
+`repo: ../hooks-repo` with a `rev`). Inside an included file:
+
+- **Local include**: relative repository paths resolve against the included
+  file's directory, using the same `resolve_relative_repo_sources` logic as the
+  main config.
+- **Remote include**: a `repo:` value that is a filesystem path, relative or
+  absolute, is an error. A remote file cannot know the layout of the machine it
+  runs on. URL-like repositories (anything containing `://`, or SCP-style
+  `user@host:path`) and `local`, `meta`, and `builtin` are allowed.
+
+### Paths inside hook definitions
+
+Includes do not change where hooks run. Every hook, whatever file defined it,
+runs in its project directory, and `entry`, `files`, `exclude`, `args`, and
+`language: script` paths are interpreted against the project, exactly as if the
+hook were written in the main config. An included local hook with
+`entry: ./scripts/lint.sh` runs the project's `scripts/lint.sh`, not a script
+next to the included file. The reference docs must say this explicitly, because
+people will expect paths relative to the included file.
+
+## Merge semantics
+
+Resolving includes produces an ordered list of **configuration sources** for a
+project: every include in listed order, then the main configuration. Hook
+construction iterates these sources in that order.
+
+### Hook order
+
+Hooks from includes come first, in the order the includes are listed, followed
+by hooks from the main config's `repos`. This matches reading the file top to
+bottom, since `includes` normally sits above `repos`.
+
+Order matters because a hook with no `priority` gets an implicit priority from
+its position, so hooks without explicit priorities run sequentially in this
+merged order.
+
+### Priorities
+
+- A priority alias is resolved against the `priorities` table of the file that
+  defines the hook. An included file cannot use an alias declared only in the
+  main config, and the main config cannot use an alias declared only in an
+  include. Unknown aliases are errors, as today.
+- The same alias name may be declared with different values in different files.
+  They do not conflict because each is scoped to its own file.
+- After aliases resolve to integers, scheduling compares priorities across all
+  hooks in the project, whichever source they came from. The existing rule that
+  priorities are compared across one project's hooks still holds. That set now
+  includes included hooks.
+
+### Top-level settings
+
+The main config's top-level settings apply to every hook in the project,
+including included hooks: `files`, `exclude`, `default_stages`,
+`default_language_version`, `default_env`, `fail_fast`, and `orphan` behave as
+if the included hooks had been written in the main file.
+
+### Hook collisions
+
+Each hook has a set of **selector names**: its `id`, plus its `alias` if it has
+one. These are the names `prek run <hook>`, `--skip`, and `SKIP` match against.
+
+It is an error when a selector name is defined in more than one configuration
+source of the same project. This covers:
+
+- an include and the main config,
+- two includes,
+- an `id` in one source matching an `alias` in another, and
+- `alias` against `alias`.
+
+It also covers `meta` and `builtin` hooks. Two sources that both add
+`check-hooks-apply` collide.
+
+Collisions are detected from configuration data alone, since hook ids and
+aliases are written in the config, so no repository needs to be cloned first.
+Detection runs after all of a project's includes are resolved and before any
+hook is cloned, installed, or run.
+
+Duplicate selector names **within one source** stay allowed. `pre-commit`
+allows listing the same hook twice with different arguments, and existing
+configs rely on that. Only collisions across sources are errors.
+
+Projects are independent. Two projects in a workspace may define the same hook
+id, including through the same include, as they can today.
+
+Error format:
+
+```text
+error: Hook `ruff` is defined in more than one configuration source of project `.`:
+  - `https://example.com/org/prek/python.yaml`: repos[0].hooks[1] (id)
+  - `.pre-commit-config.yaml`: repos[2].hooks[0] (id)
+hint: Hook ids and aliases must be unique across a configuration and its includes. Remove one of the definitions, or give it a different `id` or `alias`.
+```
+
+When several names collide, all of them are reported in one error, sorted by
+the order of their first definition. The ordering is deterministic so snapshots
+are stable.
+
+## Remote includes
+
+### Fetching
+
+- Remote includes are fetched with the shared `http::REQWEST_CLIENT`, so proxy
+  settings, `PREK_NATIVE_TLS`, `SSL_CERT_FILE`, and `SSL_CERT_DIR` behave as
+  they do for other downloads.
+- Each request has a 30 second total timeout, so an unreachable host fails
+  within bounded time instead of hanging a commit.
+- Responses larger than 1 MiB are rejected. The limit is checked against
+  `Content-Length` when present and enforced while streaming.
+- Any status other than `200` is a failure, except `304` on a conditional
+  request that has a cached entry.
+- The SHA-256 of the response body is computed while streaming, with
+  `checksum::HashReader`.
+- Within one `prek` process, each distinct normalized URL is fetched at most
+  once, even when several projects in a workspace include it. Distinct URLs are
+  fetched concurrently, bounded by the existing internal concurrency limit.
+
+### Integrity pinning
+
+`sha256` is optional.
+
+- **Unpinned** includes follow the freshness rules below and pick up upstream
+  changes when they revalidate.
+- **Pinned** includes are content-addressed. The digest covers the raw response
+  bytes, with no newline or encoding normalization, so
+  `curl -fsSL <url> | sha256sum` gives the value to write. A pinned include is
+  used only if its bytes hash to the pinned value. Otherwise it is an error.
+  Updating a pinned include means changing the digest in the config, which
+  shows up in review.
+
+Unpinned includes do not produce a warning on every run. The trade-off is
+documented in the security guide instead.
+
+### Cache
+
+Remote includes are cached in the store, under `CacheBucket::Prek`:
+
+```text
+$PREK_HOME/cache/prek/includes/
+├── entries/<url-key>.json   # one per normalized URL
+└── blobs/<sha256>           # raw content, named by its digest
+```
+
+`<url-key>` is the hex SHA-256 of the normalized URL string. An entry file
+looks like this:
+
+```json
+{
+  "version": 1,
+  "url": "https://example.com/org/prek/python.yaml",
+  "sha256": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+  "fetched_at": 1790000000,
+  "etag": "\"5f2b-1a\"",
+  "last_modified": "Tue, 22 Sep 2026 08:00:00 GMT"
+}
+```
+
+Writes must be crash-safe and safe when several processes run at once:
+
+1. Stream the body into a temp file in the store scratch directory.
+2. Parse and validate the content as an included file. **Content that fails to
+   parse or validate is never written to the cache.**
+3. Move the temp file to `blobs/<sha256>` with `fs::rename_with_retry`. If the
+   blob already exists, keep it. Blobs are immutable, so the existing file has
+   the same bytes.
+4. Write the entry JSON to a temp file and rename it over
+   `entries/<url-key>.json`.
+
+A reader always loads the entry first and then the blob it names, so it never
+sees an entry paired with the wrong content. Every read re-hashes the blob,
+which is cheap at 1 MiB or less. A blob whose hash does not match its name is
+treated as missing, as if the cache had been tampered with or truncated. An
+entry that is missing, cannot be parsed, or has an unknown `version` is treated
+as a cache miss and logged at debug level. It is not an error.
+
+A pinned include looks up `blobs/<pin>` directly and does not need an entry. So
+two URLs serving identical bytes share one blob, and a pinned include keeps
+working after the upstream URL changes content, as long as the pinned blob is
+cached.
+
+### Freshness
+
+An unpinned cache entry is **fresh** when `now - fetched_at` is less than the
+TTL, and **stale** otherwise.
+
+- The default TTL is 3600 seconds, the same as the workspace discovery cache.
+- `PREK_INCLUDE_CACHE_TTL=<seconds>` overrides it. `0` means always
+  revalidate. An invalid value produces a warning and falls back to the default,
+  the same way `DownloadChecksumPolicy::from_env` handles bad values.
+- The global `--refresh` flag makes every unpinned include stale for that
+  invocation. It does not affect pinned includes, because their content cannot
+  change.
+- Revalidating a stale entry sends `If-None-Match` and `If-Modified-Since` when
+  the entry has an `etag` or `last_modified`. A `304` response rewrites the
+  entry with a new `fetched_at` and keeps the blob.
+
+A fresh entry never touches the network, so a normal commit makes no HTTP
+requests while the TTL holds.
+
+### Resolution matrix
+
+| Pin | Cache state | Network result | Outcome |
+| -- | -- | -- | -- |
+| none | fresh, no `--refresh` | not contacted | Use cached content. |
+| none | stale or `--refresh` | `200`, valid | Update the cache and use the new content. |
+| none | stale or `--refresh` | `304` | Update `fetched_at` and use cached content. |
+| none | stale or `--refresh` | failure | **Warn** and use cached content. |
+| none | stale or `--refresh` | `200`, invalid content | **Error.** The cache is left unchanged. |
+| none | missing | `200`, valid | Cache and use it. |
+| none | missing | failure | **Error.** |
+| pinned | blob present and verified | not contacted | Use cached content. |
+| pinned | blob missing or corrupt | `200`, digest matches, valid | Cache and use it. |
+| pinned | blob missing or corrupt | `200`, digest mismatch | **Error.** Nothing is cached. |
+| pinned | blob missing or corrupt | failure | **Error.** |
+
+"Failure" means a DNS, connect, TLS, or timeout error, a non-`200` status, a
+rejected redirect, or a body over the size limit.
+
+Invalid content is an error even when an older cached copy exists. Falling back
+would hide a broken upstream file until the cache was cleared.
+
+The stale-fallback warning is printed once per URL per invocation:
+
+```text
+warning: Failed to refresh included configuration `https://example.com/org/prek/python.yaml`; using the copy cached 3h ago
+  caused by: error sending request for url (https://example.com/org/prek/python.yaml)
+```
+
+The hard error when there is no usable cache:
+
+```text
+error: Failed to fetch included configuration `https://example.com/org/prek/python.yaml`
+  caused by: HTTP status server error (503 Service Unavailable) for url (https://example.com/org/prek/python.yaml)
+hint: No cached copy is available, so `prek` cannot tell which hooks this configuration defines. Check the URL and your network connection, then try again.
+```
+
+The digest mismatch reuses the existing `Sha256Digest::verify` wording:
+
+```text
+error: SHA256 checksum mismatch for `https://example.com/org/prek/security.toml`: expected 3a6e…c8b7, got 9f86…0f08
+hint: The remote file changed. Review the new content and update the `sha256` in `.pre-commit-config.yaml`.
+```
+
+## Error model
+
+Every include problem is a hard error for the project that owns it. A hard
+error means the command exits with the normal error status **before any hook is
+cloned, installed, or executed** for the affected invocation. Hard errors are:
+
+- invalid include entries, such as a bad scheme, user info, a malformed digest,
+  unknown table keys, or both `path` and `url`,
+- a missing or unreadable local include, or one that is a directory,
+- duplicate includes and self-includes,
+- nested includes and forbidden top-level keys in an included file,
+- parse and validation errors in included files, including
+  `minimum_prek_version` and unknown priority aliases,
+- filesystem `repo:` paths in a remote include,
+- a remote fetch failure with no usable cached copy,
+- a digest mismatch, and
+- hook selector collisions across sources.
+
+The only non-fatal include condition is the stale-cache fallback for unpinned
+remote includes.
+
+Include errors get their own error type, `config::IncludeError`. They must never
+be an `Io(NotFound)` inside `config::Error`, because `Error::warn_parse_error`
+deliberately skips `NotFound` to stay quiet about a missing main config. A
+missing include must not be swallowed the same way.
+
+## Command behavior
+
+Include resolution is async and happens where hooks are materialized, not
+during workspace discovery. Discovery only needs `orphan` and each project's
+existence, and those come from the main config alone. This keeps the parallel
+directory walker synchronous and network-free, and it means the workspace
+discovery cache needs no changes. Local includes are re-read on every
+resolution, so editing one takes effect on the next run without `--refresh`.
+
+| Command | Include behavior |
+| -- | -- |
+| `prek run`, `prek hook-impl` | Resolve with network allowed, then collision check, then build hooks. `--refresh` revalidates unpinned includes. |
+| `prek list` | Same as `run`, so included hooks are listed. |
+| `prek exec` | Same as `run`. |
+| `prek install --prepare-hooks`, `prek prepare-hooks` | Same as `run`, so hook environments for included hooks are prepared. |
+| `prek install` (shims only) | No resolution. `default_install_hook_types` comes from the main config only. |
+| `prek validate-config` | Resolves includes with network allowed and reports include errors and collisions. It becomes async. |
+| `prek update` | No resolution. Only `repos` in the main config are updated. Included files are never rewritten. |
+| `prek cache gc` | Cache-only resolution, see below. Never uses the network. |
+| `prek util yaml-to-toml` | Converts `includes` entries, both string and table forms. Included files are not converted or fetched. |
+| `prek try-repo` | Unaffected. The generated config has no includes. |
+| Shell completion | Cache-only resolution, best effort. Errors are ignored, and hooks from local and already cached remote includes are offered. |
+| `check-hooks-apply`, `check-useless-excludes` meta hooks | Cache-only resolution. The surrounding `run` has already populated the cache, so included hooks are checked too. |
+
+### Staged configuration check
+
+When `prek run` requires a clean worktree, it currently fails if a project
+config file is not staged. Local includes that live inside the Git worktree are
+added to that check, because an unstaged include changes which hooks run just as
+an unstaged main config would. Local includes outside the worktree and remote
+includes are not checked. The check uses the parsed `includes` paths and does
+not need network resolution.
+
+### Cache GC
+
+`store.track_configs` keeps tracking main config files only. `prek cache gc`,
+for each tracked config that still exists:
+
+1. Parses its `includes` without network access.
+2. Keeps `entries/<url-key>.json` for every remote URL listed, and the blobs
+   those entries name.
+3. Keeps `blobs/<pin>` for every pinned include.
+4. Resolves local includes and cached remote includes, so remote repositories
+   and hook environments referenced only by included files are also kept.
+
+Entries and blobs that nothing references are removed. `--dry-run` and
+`--verbose` report them in an `includes` section, like other removed items. If
+a tracked config cannot be parsed, it is kept and its include cache is left
+alone, matching the current handling of unparseable configs.
+
+## Workspace behavior
+
+- Each project resolves its own includes. Includes are not inherited from a
+  parent project, and `orphan` is unchanged.
+- Resolution runs only for **selected** projects, the ones `init_hooks`
+  receives. A broken include in a project outside the selection does not fail
+  the run.
+- Fetches are deduplicated across projects, as described in
+  [Fetching](#fetching).
+- Collisions are checked per project.
+
+## Security
+
+Included files are executable project configuration. A remote include can add
+`repo: local` hooks whose `entry` runs arbitrary commands, so including a URL
+grants whoever controls that URL code execution on every contributor's machine
+and in CI.
+
+`docs/security.md` gets a new section, "Review and pin included
+configurations":
+
+- Treat an include URL like a dependency. Prefer hosts your organization
+  controls.
+- An unpinned include can change without a change in your repository. Changes
+  reach users within the cache TTL.
+- A `sha256` pin makes the included content immutable. Review the content
+  before updating the pin.
+- A pin is only as good as your review. `prek` checks that the bytes match, not
+  that they are safe.
+- Credentials in include URLs are rejected. Private includes are not supported
+  yet.
+
+`prek` never runs hooks from a remote include whose content it could not
+verify against a pin, and it never runs hooks from content that failed to parse.
+
+## Compatibility
+
+- `includes` is `prek`-only. Upstream `pre-commit` warns about an unexpected
+  root key and runs without the included hooks. Older `prek` versions do the
+  same through the unused-key warning. The reference docs recommend setting
+  `minimum_prek_version` to the first version that supports includes, so older
+  `prek` fails instead of silently skipping hooks.
+- Configurations without `includes` behave exactly as before. No network access
+  happens, no cache directory is created, and no messages change.
+- `docs/compatibility.md` lists `includes` among the `prek`-only extensions.
+
+## Implementation
+
+### New and changed types
+
+`crates/prek/src/config/include.rs` (new):
+
+```rust
+/// One entry of the top-level `includes` list, as written in the config.
+pub(crate) enum Include {
+    Local { path: PathBuf },
+    Remote { url: reqwest::Url, sha256: Option<Sha256Digest> },
+}
+
+/// A configuration file included by a project.
+pub(crate) struct IncludedConfig {
+    pub repos: Vec<Repo>,
+    pub priorities: BTreeMap<PriorityAlias, u32>,
+    pub minimum_prek_version: Option<String>,
+    _unused_keys: BTreeMap<String, serde_json::Value>,
+}
+
+/// Where a set of hook definitions came from, for ordering and messages.
+pub(crate) enum ConfigSource {
+    Main(PathBuf),
+    LocalInclude(PathBuf),
+    RemoteInclude(reqwest::Url),
+}
+```
+
+- `Include` gets a hand-written `Deserialize` visitor that accepts a string or
+  a map. It follows the style of the `Repo` visitors in `config/repo.rs`, so
+  every rule in [Include entries](#include-entries) fails with a positioned
+  serde error. It also gets a `schemars::JsonSchema` implementation, a `oneOf`
+  of string and object.
+- `IncludedConfig` reuses `deserialize_and_validate_minimum_version`. Forbidden
+  keys are detected by name in `_unused_keys`, using a
+  `FORBIDDEN_INCLUDE_KEYS` constant next to `EXPECTED_UNUSED`. This reuses the
+  existing unused-key mechanism instead of adding a second parser.
+- `Config` gets `#[serde(default)] pub includes: Vec<Include>`.
+  `load_config` resolves relative local include paths against the config file's
+  directory, next to `resolve_relative_repo_sources`, so later stages only see
+  absolute paths.
+- `config::IncludeError` (thiserror) has one variant per hard error in
+  [Error model](#error-model). `workspace::Error` gets
+  `Include(#[from] IncludeError)`.
+
+`crates/prek/src/includes.rs` (new) holds fetching and caching:
+
+```rust
+pub(crate) enum IncludeFetch {
+    /// Use the network for missing or stale entries.
+    Network { refresh: bool },
+    /// Never use the network. A missing remote entry is an error.
+    CacheOnly,
+}
+
+/// The resolved configuration sources of one project, in hook order.
+pub(crate) struct ProjectSources {
+    includes: Vec<(ConfigSource, IncludedConfig)>,
+}
+
+pub(crate) async fn resolve_includes(
+    store: &Store,
+    projects: &[Arc<Project>],
+    fetch: IncludeFetch,
+) -> Result<Vec<ProjectSources>, IncludeError>;
+```
+
+Cache-only resolution does no network I/O but shares the async signature. The
+two synchronous callers, shell completion and cache GC, use a small
+`resolve_includes_cached` wrapper that runs the same cache lookup and parse code
+without a runtime. The parse, validation, and collision code is shared, so the
+two paths cannot drift.
+
+### Hook construction
+
+- `ProjectInitPlan` changes from a flat `repo_configs` list to a list of
+  per-source plans, each carrying its `ConfigSource`, its `priorities` table,
+  and its filtered repo configs. `remote_configs_to_clone` and `build_hooks`
+  iterate those plans in order.
+- Priority resolution moves from `Hook::from_spec`, which reads
+  `project.config().priorities`, to plan construction, where the defining
+  source's table is known. `HookSpec` carries the resolved `Priority`.
+- `Workspace::init_hooks` and `Project::init_hooks` call `resolve_includes`,
+  then `check_hook_collisions`, then build plans. Both take the `refresh` flag
+  the CLI already passes around.
+- `check_hook_collisions(sources: &[(ConfigSource, &[Repo])]) -> Result<(), IncludeError>`
+  is a pure function, so it can be unit tested without any I/O.
+
+### Touched files
+
+- `crates/prek/src/config/mod.rs`: `includes` field, include path resolution,
+  error variant, and the unused-key and mutable-`rev` warnings for included
+  files.
+- `crates/prek/src/config/include.rs` (new): entry parsing, `IncludedConfig`,
+  and collision checks.
+- `crates/prek/src/includes.rs` (new): fetching, cache, and freshness.
+- `crates/prek/src/workspace.rs`: plans, `init_hooks`, and the
+  `check_configs_staged` extension.
+- `crates/prek/src/hook.rs`: priority resolution input.
+- `crates/prek/src/cli/validate.rs`: async validation with includes.
+- `crates/prek/src/cli/cache_gc.rs`: include cache pruning and included repos.
+- `crates/prek/src/cli/completion.rs`: included hook ids.
+- `crates/prek/src/hooks/meta_hooks.rs`: included hooks in meta checks.
+- `crates/prek/src/cli/yaml_to_toml.rs`: `includes` conversion.
+- `crates/prek-consts/src/env_vars.rs`: `PREK_INCLUDE_CACHE_TTL`.
+- `prek.schema.json`: regenerated with `PREK_GENERATE=1`.
+- Docs: see [Documentation](#documentation).
+
+## Testing
+
+Tests follow the repository conventions: `insta` snapshots regenerated with
+`cargo insta review`, `cmd_snapshot!` for CLI behavior, and focused tests
+instead of the full integration suite.
+
+### Test infrastructure
+
+**`TestHttpServer`** in `crates/prek/tests/common/mod.rs`. It uses only
+`std::net::TcpListener` on `127.0.0.1:0` and a background thread, with no new
+dependency, following the raw listener used in the `http.rs` unit tests. It
+provides:
+
+- `url(path) -> String`,
+- `set(path, Response { status, body, headers })`, which can change routes
+  between commands in one test,
+- `requests(path) -> Vec<RecordedRequest>` with the request headers, to assert
+  request counts and conditional headers,
+- `close()` to simulate an unreachable host (the port refuses connections), and
+- a snapshot filter that maps `127.0.0.1:<port>` to `[SERVER]`.
+
+Loopback `http` is a supported product rule, so tests need no hidden test-only
+escape hatch.
+
+A second filter replaces cache ages such as `cached 3s ago` with
+`cached [AGE] ago`.
+
+For unit tests in `includes.rs`, extend the existing `serve_once` pattern into
+a `serve_sequence` helper that answers a fixed list of responses and records
+requests.
+
+### Unit tests: `config/include.rs`
+
+Parsing, each in YAML and TOML unless marked:
+
+1. `parse_include_string_local_relative`: `ci/a.yaml` becomes `Local`, resolved
+   against the config directory after `load_config`.
+2. `parse_include_string_local_absolute` and `parse_include_string_tilde`.
+3. `parse_include_string_https`: becomes `Remote` with no pin.
+4. `parse_include_table_url_with_sha256`: lowercase, uppercase, and
+   `sha256:`-prefixed digests parse to the same value.
+5. `parse_include_table_path`.
+6. `reject_include_table_path_and_url`: positioned error snapshot.
+7. `reject_include_table_without_location`.
+8. `reject_include_sha256_with_path`.
+9. `reject_include_invalid_sha256`: too short, non-hex, and 65 characters.
+10. `reject_include_unknown_table_key`: `sha265` is rejected with a positioned
+    error. This is a regression guard for silently lost pins.
+11. `reject_include_insecure_http`: `http://example.com/a.yaml`.
+12. `allow_include_loopback_http`: `localhost`, `127.0.0.1:8080`, `[::1]`.
+13. `reject_include_other_schemes`: `file://`, `ftp://`, `git+https://`.
+14. `reject_include_userinfo`: `https://u:p@host/a.yaml`.
+15. `reject_include_empty`: `""` and `{ path = "" }`.
+16. `config_without_includes_defaults_empty`: regression guard. The existing
+    `parse_repos` debug snapshots gain `includes: []` and are regenerated once.
+17. `include_format_from_url_path`: `a.toml`, `a.toml?token=x`, `a.yaml`, `a`,
+    and `a.TOML`.
+
+Included file validation:
+
+18. `included_config_allows_repos_priorities_minimum_version`.
+19. `included_config_rejects_each_forbidden_key`: table-driven over
+    `FORBIDDEN_INCLUDE_KEYS`, asserting the key and source appear in the error.
+20. `included_config_rejects_nested_includes`: dedicated message.
+21. `included_config_ignores_ci_and_extension_keys`: no unused-key warning.
+22. `included_config_collects_unknown_keys`: paths such as `repos[0].foo` are
+    reported against the include source.
+23. `included_config_requires_repos`.
+24. `included_config_minimum_version_too_new`: uses `VERSION_FILTER`.
+25. `included_priority_alias_scoped_to_file`: an include alias works, an alias
+    from the main config is rejected in the include, and the reverse is also
+    rejected.
+26. `remote_include_rejects_path_repo`: relative, absolute, and Windows drive
+    paths.
+27. `remote_include_allows_url_and_special_repos`: `https://`, SCP-style,
+    `file://`, `local`, `meta`, `builtin`.
+28. `local_include_resolves_relative_repo_against_include_dir`.
+
+Duplicates:
+
+29. `reject_duplicate_local_include`: `./a.yaml` and `a.yaml`.
+30. `reject_duplicate_remote_include`: URLs equal after normalization, such as
+    host case and a default port.
+31. `reject_self_include`.
+
+Collisions (`check_hook_collisions`, pure):
+
+32. `no_collision_distinct_ids`.
+33. `collision_include_vs_main`.
+34. `collision_between_includes`.
+35. `collision_alias_vs_id`, in both directions.
+36. `collision_alias_vs_alias`.
+37. `collision_meta_hooks`.
+38. `duplicate_within_one_source_allowed`: regression guard for `pre-commit`
+    behavior.
+39. `collision_error_lists_all_names_in_definition_order`: snapshot of the
+    whole message.
+40. `collision_ignores_hook_name`: equal `name` values with different `id`s are
+    fine.
+
+### Unit tests: `includes.rs`
+
+Each test uses a temp `Store` and a local server.
+
+41. `fetch_miss_populates_cache`: the entry and blob exist, and the blob name
+    equals its digest.
+42. `fresh_entry_makes_no_request`: the server records zero requests.
+43. `stale_entry_revalidates_with_conditional_headers`: `If-None-Match` and
+    `If-Modified-Since` are sent. A `304` bumps `fetched_at` and keeps the blob.
+44. `stale_entry_replaced_on_200`.
+45. `stale_entry_network_failure_falls_back`: returns a `Stale` outcome carrying
+    the age and the cause.
+46. `miss_network_failure_is_error`: connection refused.
+47. `miss_http_error_is_error`: 404 and 500, with the status in the error.
+48. `refresh_revalidates_fresh_unpinned`.
+49. `pinned_hit_makes_no_request_even_with_refresh`.
+50. `pinned_miss_fetches_and_verifies`.
+51. `pinned_mismatch_is_error_and_not_cached`: no blob or entry is written.
+52. `pinned_corrupt_blob_refetches`: a tampered blob is replaced after a
+    successful fetch.
+53. `pinned_corrupt_blob_offline_is_error`.
+54. `invalid_content_not_cached`: with a stale valid entry, a `200` with broken
+    YAML is an error and the old entry and blob are untouched.
+55. `oversized_content_rejected`: rejected via `Content-Length` and via a
+    chunked body with no length.
+56. `redirect_to_insecure_http_rejected`: the final-URL check, unit tested on
+    the helper.
+57. `corrupt_entry_json_is_miss`, and `unknown_entry_version_is_miss`.
+58. `concurrent_fetch_same_url_is_consistent`: two tasks fetch the same URL,
+    and the final entry and blob agree.
+59. `fetch_deduplicated_within_process`: two projects including one URL produce
+    one request.
+60. `cache_key_uses_normalized_url`.
+61. `ttl_from_env`: default, `0`, a valid value, and an invalid value that warns
+    and uses the default.
+62. `cache_only_mode_never_requests`: a missing entry is an error, and a stale
+    entry is used without a warning.
+
+### Integration tests: `crates/prek/tests/includes.rs` (new)
+
+All of these use `cmd_snapshot!`. Tests that check that hooks did not run use a
+local hook that writes a marker file, and assert the file is absent.
+
+Basic behavior:
+
+63. `local_include_runs_included_hooks`.
+64. `multiple_includes_run_in_listed_order_before_main`: sequential output
+    order in the snapshot.
+65. `mixed_local_and_remote_includes`.
+66. `toml_main_includes_yaml_and_yaml_main_includes_toml`.
+67. `remote_toml_include_by_extension`.
+68. `include_with_empty_repos`.
+69. `included_local_hook_entry_runs_from_project_root`: the entry script sits
+    next to the project, not next to the include.
+70. `remote_include_with_remote_repo`: a `create_hook_repo` fixture referenced
+    by a `file://` URL from a served include. The repo is cloned and the hook
+    runs.
+71. `include_applies_main_top_level_settings`: the main config's `exclude` and
+    `default_stages` affect included hooks.
+72. `include_priorities_schedule_across_sources`: aliases from the include and
+    numbers from the main config interleave as expected.
+
+Paths and workspace:
+
+73. `include_relative_to_config_not_cwd`: run from a subdirectory with `--cd`.
+74. `include_with_explicit_config_flag`: `--config other/cfg.yaml` resolves
+    includes relative to `other/`.
+75. `workspace_project_includes_shared_file`: `a/` and `b/` both include
+    `../shared.yaml`, and each gets its own hooks with no collision.
+76. `workspace_shared_remote_include_fetched_once`: the server sees one request.
+77. `workspace_broken_include_in_unselected_project`: `prek run a/` succeeds
+    while `b/` has a missing include.
+78. `editing_local_include_takes_effect_without_refresh`: regression guard for
+    the workspace cache.
+
+Hard errors:
+
+79. `missing_local_include_is_error`.
+80. `include_directory_is_error`.
+81. `self_include_is_error`, and `duplicate_include_is_error`.
+82. `nested_include_is_error`.
+83. `forbidden_key_in_include_is_error`: `default_stages`.
+84. `remote_first_fetch_failure_is_error`: the server is closed. Exit status and
+    the hint are in the snapshot, and no marker file exists.
+85. `remote_first_fetch_http_500_is_error`.
+86. `pinned_mismatch_is_error`: no hook runs.
+87. `collision_include_vs_main_is_error`: no hook runs, including hooks from
+    other projects in the same invocation.
+88. `collision_between_includes_is_error`.
+89. `collision_alias_vs_id_is_error`.
+90. `include_minimum_prek_version_is_error`.
+91. `remote_include_path_repo_is_error`.
+92. `insecure_http_include_is_error`.
+
+Caching:
+
+93. `cached_remote_include_used_while_fresh`: first run fetches, then the server
+    closes, and the second run succeeds with no warning and no request.
+94. `stale_remote_include_falls_back_with_warning`: `PREK_INCLUDE_CACHE_TTL=0`,
+    server closed, a warning, exit success.
+95. `refresh_flag_revalidates`: the request count goes up with `--refresh` and
+    not without it.
+96. `upstream_change_picked_up_after_ttl`: serve v1, then v2 with TTL `0`. The
+    v2 hook runs.
+97. `pinned_include_works_offline_with_refresh`.
+98. `broken_upstream_does_not_poison_cache`: after a valid fetch, the server
+    returns broken YAML. The run errors, then the server is fixed, and the run
+    uses the old cached content if the TTL has not expired, or the new content
+    if it has.
+
+Other commands:
+
+99. `validate_config_with_includes`: valid, collision, missing include, and an
+    unreachable remote include.
+100. `list_shows_included_hooks`: text and JSON output.
+101. `run_selects_and_skips_included_hooks`: `prek run <included-id>`, `--skip`,
+     and `SKIP=`.
+102. `unstaged_local_include_blocks_run`: the include is inside the repo.
+103. `include_outside_repo_not_staged_checked`.
+104. `git_commit_runs_included_hooks`: `prek install`, then `git commit` goes
+     through `hook-impl`.
+105. `prepare_hooks_fails_on_missing_include`: `prek install --prepare-hooks`
+     errors. This is the regression guard for `warn_parse_error` swallowing
+     `NotFound`.
+106. `update_ignores_included_repos`: only main config revs change, and the
+     include file is byte-identical afterwards.
+107. `meta_check_hooks_apply_sees_included_hooks`.
+108. `mutable_rev_warning_names_include_source`.
+109. `unknown_key_warning_names_include_source`.
+
+Additions to existing test files:
+
+- `tests/cache.rs`: `cache_gc_keeps_referenced_include_entries`,
+  `cache_gc_removes_unreferenced_include_entries` (after the include is
+  removed from the config), `cache_gc_keeps_pinned_blob`,
+  `cache_gc_keeps_repos_referenced_by_includes`, and a `--dry-run --verbose`
+  output snapshot.
+- `tests/yaml_to_toml.rs`: `yaml_to_toml_converts_includes`, covering string
+  and table entries with `sha256`.
+- `tests/run/completion.rs`: `completion_offers_included_hook_ids`, with a
+  local include and a cached remote include.
+- `schema.rs::generate_json_schema`: regenerate `prek.schema.json` with
+  `PREK_GENERATE=1` and review the new `includes` definition.
+
+### Regression tests
+
+These guard existing behavior, and each maps to a risk this change introduces:
+
+| Risk | Guard |
+| -- | -- |
+| Configs without includes change behavior | Existing suites pass unchanged, apart from the regenerated `Config` debug snapshots in test 16. |
+| Network access without includes | Test 42's zero-request harness, plus a run with a closed server and no includes. |
+| `pre-commit` duplicate hook lists break | Test 38, plus an integration run with the same hook twice in one file. |
+| Priority aliases resolve against the wrong table | Tests 25 and 72. |
+| Missing include swallowed as "no config" | Test 105. |
+| Workspace cache hides include edits | Test 78. |
+| Silent pin loss from typos | Test 10. |
+| Stale fallback hides broken upstream | Tests 54 and 98. |
+| `prek update` writes to the wrong file | Test 106. |
+| GC deletes caches still in use | The `tests/cache.rs` additions. |
+
+## Documentation
+
+- `docs/reference/configuration.md`: a new "`includes`" section under top-level
+  keys, with both formats, entry forms, path rules, the included file format,
+  hook order, collision rules, and caching. `repos` gets a note that included
+  hooks come first.
+- `docs/reference/environment-variables.md`: `PREK_INCLUDE_CACHE_TTL`.
+- `docs/security.md`: the section described in [Security](#security).
+- `docs/compatibility.md`: `includes` listed as `prek`-only.
+- `docs/monorepos.md` or `docs/cookbook.md`: a short recipe for a shared baseline
+  include.
+- `docs/reference/cli.md`: regenerate if the `--refresh` help text changes to
+  mention includes.
+
+## Future work
+
+- Overrides: letting the main config adjust `args`, `files`, or `stages` of an
+  included hook by id, instead of redefining it.
+- Top-level settings scoped to the hooks of one include.
+- Private includes with a token from the environment or a credential helper.
+- `prek update --includes`, which writes `sha256` pins for remote includes and
+  bumps `rev`s in local included files.
+- A setting that requires every remote include to be pinned.
+- Include sources in `prek list --output-format=json`.
+- Nested includes, with cycle detection.
+
+## Open questions
+
+- **TTL default.** One hour matches the workspace cache and keeps commits
+  offline-friendly. A longer default reduces request volume for large teams,
+  and a shorter one propagates upstream changes faster.
+- **Forbidden keys versus warnings.** This spec rejects project-level keys in
+  included files. Warning and ignoring them would let people include a full
+  existing `.pre-commit-config.yaml`, as the example in the issue does, at the
+  cost of silently different behavior.
+- **Hook order.** Includes before main follows reading order. Main-first would
+  let project hooks such as formatters run before shared checks without
+  explicit priorities.
