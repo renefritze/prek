@@ -1,9 +1,11 @@
 # Configuration includes
 
 This document specifies `includes`, a way for a project configuration to pull
-hook definitions from other configuration files. An include can be a local file
-or a remote file fetched over HTTPS. Remote includes are cached, and they can be
-pinned to a SHA-256 digest of their content.
+hook definitions from other configuration files. An include can be a local
+file, a remote file fetched over HTTPS, or a file inside a Git repository at a
+given revision. Remote includes are cached, and they can be pinned to a SHA-256
+digest of their content. Git includes reuse the store's repository clones and are
+pinned by their `rev`.
 
 Tracking issue: [j178/prek#1238](https://github.com/j178/prek/issues/1238).
 The design follows the direction discussed in
@@ -30,7 +32,8 @@ the result as one project configuration.
 ## Goals
 
 - Include hook definitions from one or more files, listed in order.
-- Allow local paths and remote HTTPS URLs in the same list.
+- Allow local paths, remote HTTPS URLs, and files in Git repositories in the
+  same list.
 - Cache remote includes so ordinary runs work offline and do not pay a network
   round trip on every commit.
 - Let users pin a remote include to the exact bytes they reviewed, without
@@ -45,7 +48,8 @@ the result as one project configuration.
   overrides". This spec only supports additions. Two sources defining the same
   hook is an error, not an override. See [Future work](#future-work).
 - Nested includes. An included file cannot include other files.
-- Authentication for private remote includes.
+- Authentication for private HTTPS includes. Private sources are supported
+  through [Git includes](#git-includes), which use the user's Git credentials.
 - Includes in hook manifests (`.pre-commit-hooks.yaml`).
 - Rewriting included files with `prek update`.
 - Top-level settings in included files, such as `default_stages` or `exclude`.
@@ -66,6 +70,9 @@ A new optional top-level key, `includes`, is added to the project configuration.
       - url: https://example.com/org/prek/security.toml
         sha256: 3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7
       - path: ../shared/rust.yaml
+      - repo: https://github.com/org/prek-shared
+        rev: v1.4.0
+        path: go.yaml
 
     repos:
       - repo: local
@@ -84,6 +91,7 @@ A new optional top-level key, `includes`, is added to the project configuration.
       "https://example.com/org/prek/python.yaml",
       { url = "https://example.com/org/prek/security.toml", sha256 = "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7" },
       { path = "../shared/rust.yaml" },
+      { repo = "https://github.com/org/prek-shared", rev = "v1.4.0", path = "go.yaml" },
     ]
 
     [[repos]]
@@ -112,19 +120,27 @@ string is a local path. There is no other scheme detection, so a string like
 `file:///etc/x.yaml` or `git+https://...` is rejected instead of being treated
 as a path.
 
-A table has exactly one location key and an optional digest:
+A table has one of three shapes:
 
-| Key | Type | Meaning |
+| Shape | Keys | Meaning |
 | -- | -- | -- |
-| `path` | string | Local file path. |
-| `url` | string | Remote URL. |
-| `sha256` | string | Optional. Expected SHA-256 of the remote file's bytes. Only valid with `url`. |
+| Local | `path` | Local file path. |
+| Remote | `url`, optional `sha256` | HTTPS URL, optionally pinned to the SHA-256 of the file's bytes. |
+| Git | `repo`, `rev`, `path` | File at `path` inside the Git repository `repo` at revision `rev`. |
+
+The shape is decided by the keys present: `url` means remote, `repo` means Git,
+and `path` alone means local. Git includes have no string shorthand, because a
+Git include always needs three values.
 
 Table rules, all enforced during parsing so errors carry a line and column:
 
-- Exactly one of `path` or `url` is required. Both or neither is an error.
-- `sha256` together with `path` is an error. Local files are already under the
-  user's control, and a digest there would only go stale.
+- `url` together with `repo` or `path` is an error.
+- `repo` without `rev` or without `path` is an error. `rev` without `repo` is an
+  error.
+- `sha256` is only valid with `url`. With `path` it is an error because local
+  files are already under the user's control and a digest would only go stale.
+  With `repo` it is an error because a commit SHA `rev` already pins the
+  content. See [Git includes](#git-includes).
 - Unknown keys in an include table are an error, not a warning. A typo like
   `sha265` would otherwise disable pinning without any visible sign.
 - `sha256` accepts 64 hex characters, case-insensitive, with an optional
@@ -162,6 +178,21 @@ Table rules, all enforced during parsing so errors carry a line and column:
   subject to the staged-config check described in
   [Command behavior](#command-behavior).
 
+### Git include rules
+
+- `repo` accepts the same values as a remote hook repository's `repo`: HTTPS,
+  SSH, SCP-style, and `file://` URLs, plus local repository paths. A relative
+  local repository path resolves against the directory of the configuration file
+  that lists it, using `resolve_relative_repo_sources`. `local`, `meta`, and
+  `builtin` are errors here.
+- `rev` accepts the same values as a hook repository's `rev`: a tag, a commit
+  SHA, or a branch. A branch produces the existing mutable-`rev` warning.
+- `path` is relative to the repository root. It must not be absolute, and after
+  normalization it must not start with `..`. A `path` that escapes the checkout
+  is an error, so an include can never read files outside the clone.
+- The file format is chosen by the extension of `path`, the same way as for
+  local files.
+
 ### Duplicate and self includes
 
 These are errors:
@@ -169,6 +200,9 @@ These are errors:
 - The same local file listed twice, compared after canonicalization, so
   `./a.yaml` and `a.yaml` count as the same file.
 - The same remote URL listed twice, compared after normalization.
+- The same Git `(repo, rev, path)` listed twice. `path` is compared after
+  normalization. The same `repo` and `rev` with different `path`s is fine and
+  shares one clone.
 - A local include that resolves to the main configuration file itself.
 
 Listing the same file twice would make every hook in it collide with itself. The
@@ -216,7 +250,8 @@ warning: Ignored unexpected keys in `https://example.com/org/prek/python.yaml`: 
 ```
 
 The existing mutable-`rev` warning also applies to remote repositories declared
-in included files, and it names the include source next to each repository.
+in included files, and to the `rev` of Git includes. It names the include source
+next to each repository.
 
 ### Repository paths inside included files
 
@@ -226,10 +261,13 @@ Existing configs may use a local directory as `repo:` (for example
 - **Local include**: relative repository paths resolve against the included
   file's directory, using the same `resolve_relative_repo_sources` logic as the
   main config.
-- **Remote include**: a `repo:` value that is a filesystem path, relative or
-  absolute, is an error. A remote file cannot know the layout of the machine it
-  runs on. URL-like repositories (anything containing `://`, or SCP-style
-  `user@host:path`) and `local`, `meta`, and `builtin` are allowed.
+- **Remote and Git includes**: a `repo:` value that is a filesystem path,
+  relative or absolute, is an error. A shared file cannot know the layout of the
+  machine it runs on. Resolving against a Git checkout is also rejected, because
+  the checkout lives in the store and a hook repository nested inside it is
+  almost certainly a mistake. URL-like repositories (anything containing `://`,
+  or SCP-style `user@host:path`) and `local`, `meta`, and `builtin` are
+  allowed.
 
 ### Paths inside hook definitions
 
@@ -294,9 +332,11 @@ It also covers `meta` and `builtin` hooks. Two sources that both add
 `check-hooks-apply` collide.
 
 Collisions are detected from configuration data alone, since hook ids and
-aliases are written in the config, so no repository needs to be cloned first.
-Detection runs after all of a project's includes are resolved and before any
-hook is cloned, installed, or run.
+aliases are written in the config, so no hook repository needs to be cloned
+first. Only Git include repositories are cloned before the check, because their
+files are the configuration data. Detection runs after all of a project's
+includes are resolved and before any hook repository is cloned or any hook is
+installed or run.
 
 Duplicate selector names **within one source** stay allowed. `pre-commit`
 allows listing the same hook twice with different arguments, and existing
@@ -463,6 +503,60 @@ error: SHA256 checksum mismatch for `https://example.com/org/prek/security.toml`
 hint: The remote file changed. Review the new content and update the `sha256` in `.pre-commit-config.yaml`.
 ```
 
+## Git includes
+
+A Git include reads one file from a Git repository at a revision. It reuses the
+store's existing repository clones instead of adding a new cache.
+
+### Cloning
+
+- Each Git include becomes a `config::RemoteRepo` with no hooks, built with
+  `RemoteRepo::new(repo, rev, Vec::new())`. Its store key, store path, and
+  relative-source handling are the same as for a hook repository.
+- Git includes from all selected projects are cloned in one
+  `Store::clone_repos` batch. That gives parallel clones, the auth-failure retry
+  with terminal prompts outside CI, the `.prek-repo.json` marker, and crash-safe
+  persistence through `fs::rename_with_retry`, with no new code.
+- A Git include and a hook repository with the same `(repo, rev)` share one
+  clone. So do several Git includes that name different `path`s in the same
+  `(repo, rev)`.
+- After cloning, `<checkout>/<path>` is read and handed to the same parser and
+  validator used for local includes. Then it goes through the checks in
+  [Included file format](#included-file-format).
+- `git::clone_repo` uses the user's Git configuration, so credential helpers,
+  SSH keys, and `url.<base>.insteadOf` rewrites work. This is the supported way
+  to include files from private repositories.
+
+### Freshness and pinning
+
+Store clones are immutable per `(repo, rev)`. Once the marker exists, the clone
+is never fetched again. Git includes inherit that behavior:
+
+- A tag or commit SHA `rev` is effectively pinned. A commit SHA is the strongest
+  pin, as described in the security guide for hook repositories.
+- A branch `rev` does not follow the branch after the first clone. This matches
+  hook repositories and triggers the same mutable-`rev` warning.
+- `--refresh` does not re-clone, again matching hook repositories.
+  `prek cache clean` drops every clone.
+- There is no TTL, no conditional request, and no stale fallback.
+
+### Resolution matrix for Git includes
+
+| Clone state | Clone result | Outcome |
+| -- | -- | -- |
+| present (marker exists) | not attempted | Read `path` from the clone. |
+| missing | success | Persist the clone, then read `path`. |
+| missing | failure | **Error.** The existing `Failed to clone repo` error, wrapped with the include source. |
+| present or cloned | `path` missing, or not a regular file | **Error.** |
+| present or cloned | `path` fails to parse or validate | **Error.** |
+
+Error format for a missing path:
+
+```text
+error: Included configuration `go.yaml` was not found in `https://github.com/org/prek-shared` at `v1.4.0`
+hint: Check the `path`, or choose a `rev` that contains it.
+```
+
 ## Error model
 
 Every include problem is a hard error for the project that owns it. A hard
@@ -470,14 +564,16 @@ error means the command exits with the normal error status **before any hook is
 cloned, installed, or executed** for the affected invocation. Hard errors are:
 
 - invalid include entries, such as a bad scheme, user info, a malformed digest,
-  unknown table keys, or both `path` and `url`,
+  unknown table keys, `path` and `url` together, a Git include without `rev`,
+  or a Git `path` that escapes the checkout,
 - a missing or unreadable local include, or one that is a directory,
 - duplicate includes and self-includes,
 - nested includes and forbidden top-level keys in an included file,
 - parse and validation errors in included files, including
   `minimum_prek_version` and unknown priority aliases,
-- filesystem `repo:` paths in a remote include,
+- filesystem `repo:` paths in a remote or Git include,
 - a remote fetch failure with no usable cached copy,
+- a Git include clone failure, or a Git include `path` missing at that `rev`,
 - a digest mismatch, and
 - hook selector collisions across sources.
 
@@ -506,11 +602,11 @@ resolution, so editing one takes effect on the next run without `--refresh`.
 | `prek install --prepare-hooks`, `prek prepare-hooks` | Same as `run`, so hook environments for included hooks are prepared. |
 | `prek install` (shims only) | No resolution. `default_install_hook_types` comes from the main config only. |
 | `prek validate-config` | Resolves includes with network allowed and reports include errors and collisions. It becomes async. |
-| `prek update` | No resolution. Only `repos` in the main config are updated. Included files are never rewritten. |
-| `prek cache gc` | Cache-only resolution, see below. Never uses the network. |
+| `prek update` | No resolution. Only `repos` in the main config are updated. Included files and Git include `rev`s are never rewritten. |
+| `prek cache gc` | Cache-only resolution, see below. Never uses the network or clones. |
 | `prek util yaml-to-toml` | Converts `includes` entries, both string and table forms. Included files are not converted or fetched. |
 | `prek try-repo` | Unaffected. The generated config has no includes. |
-| Shell completion | Cache-only resolution, best effort. Errors are ignored, and hooks from local and already cached remote includes are offered. |
+| Shell completion | Cache-only resolution, best effort. Errors are ignored, and hooks from local, already cached remote, and already cloned Git includes are offered. |
 | `check-hooks-apply`, `check-useless-excludes` meta hooks | Cache-only resolution. The surrounding `run` has already populated the cache, so included hooks are checked too. |
 
 ### Staged configuration check
@@ -518,8 +614,8 @@ resolution, so editing one takes effect on the next run without `--refresh`.
 When `prek run` requires a clean worktree, it currently fails if a project
 config file is not staged. Local includes that live inside the Git worktree are
 added to that check, because an unstaged include changes which hooks run just as
-an unstaged main config would. Local includes outside the worktree and remote
-includes are not checked. The check uses the parsed `includes` paths and does
+an unstaged main config would. Local includes outside the worktree, remote
+includes, and Git includes are not checked. The check uses the parsed `includes` paths and does
 not need network resolution.
 
 ### Cache GC
@@ -531,8 +627,11 @@ for each tracked config that still exists:
 2. Keeps `entries/<url-key>.json` for every remote URL listed, and the blobs
    those entries name.
 3. Keeps `blobs/<pin>` for every pinned include.
-4. Resolves local includes and cached remote includes, so remote repositories
-   and hook environments referenced only by included files are also kept.
+4. Marks the store clone of every Git include as used, through the same
+   `store.repo_path` key logic used for hook repositories.
+5. Resolves local includes, cached remote includes, and already cloned Git
+   includes, so remote repositories and hook environments referenced only by
+   included files are also kept.
 
 Entries and blobs that nothing references are removed. `--dry-run` and
 `--verbose` report them in an `includes` section, like other removed items. If
@@ -547,15 +646,16 @@ alone, matching the current handling of unparseable configs.
   receives. A broken include in a project outside the selection does not fail
   the run.
 - Fetches are deduplicated across projects, as described in
-  [Fetching](#fetching).
+  [Fetching](#fetching). Git include clones are deduplicated by the store key,
+  as described in [Cloning](#cloning).
 - Collisions are checked per project.
 
 ## Security
 
-Included files are executable project configuration. A remote include can add
-`repo: local` hooks whose `entry` runs arbitrary commands, so including a URL
-grants whoever controls that URL code execution on every contributor's machine
-and in CI.
+Included files are executable project configuration. A remote or Git include
+can add `repo: local` hooks whose `entry` runs arbitrary commands, so including
+one grants whoever controls that URL or repository code execution on every
+contributor's machine and in CI.
 
 `docs/security.md` gets a new section, "Review and pin included
 configurations":
@@ -568,8 +668,10 @@ configurations":
   before updating the pin.
 - A pin is only as good as your review. `prek` checks that the bytes match, not
   that they are safe.
-- Credentials in include URLs are rejected. Private includes are not supported
-  yet.
+- Credentials in include URLs are rejected. For private shared configuration,
+  use a Git include, which authenticates through your Git credential setup.
+- For Git includes, a commit SHA `rev` is the equivalent of a `sha256` pin. A
+  tag can be moved by the repository maintainer, and a branch is not a pin.
 
 `prek` never runs hooks from a remote include whose content it could not
 verify against a pin, and it never runs hooks from content that failed to parse.
@@ -596,6 +698,7 @@ verify against a pin, and it never runs hooks from content that failed to parse.
 pub(crate) enum Include {
     Local { path: PathBuf },
     Remote { url: reqwest::Url, sha256: Option<Sha256Digest> },
+    Git { repo: RemoteRepo, path: RelativeIncludePath },
 }
 
 /// A configuration file included by a project.
@@ -611,8 +714,14 @@ pub(crate) enum ConfigSource {
     Main(PathBuf),
     LocalInclude(PathBuf),
     RemoteInclude(reqwest::Url),
+    GitInclude { repo: String, rev: String, path: PathBuf },
 }
 ```
+
+`RelativeIncludePath` is a newtype whose constructor rejects absolute paths and
+paths that escape the root after normalization. Once an `Include::Git` exists,
+its path is known to be safe to join onto a checkout, and the type system
+enforces that instead of a runtime check at the join.
 
 - `Include` gets a hand-written `Deserialize` visitor that accepts a string or
   a map. It follows the style of the `Repo` visitors in `config/repo.rs`, so
@@ -623,6 +732,9 @@ pub(crate) enum ConfigSource {
   keys are detected by name in `_unused_keys`, using a
   `FORBIDDEN_INCLUDE_KEYS` constant next to `EXPECTED_UNUSED`. This reuses the
   existing unused-key mechanism instead of adding a second parser.
+- `Include::Git` reuses `RemoteRepo`, so `resolve_relative_repo_sources` covers
+  relative repository paths for Git includes. The loop gains a second pass over
+  `includes` next to the existing pass over `repos`.
 - `Config` gets `#[serde(default)] pub includes: Vec<Include>`.
   `load_config` resolves relative local include paths against the config file's
   directory, next to `resolve_relative_repo_sources`, so later stages only see
@@ -631,13 +743,16 @@ pub(crate) enum ConfigSource {
   [Error model](#error-model). `workspace::Error` gets
   `Include(#[from] IncludeError)`.
 
-`crates/prek/src/includes.rs` (new) holds fetching and caching:
+`crates/prek/src/includes.rs` (new) holds fetching, caching, and Git include
+reads. Git includes call `Store::clone_repos` directly and add no cache code of
+their own:
 
 ```rust
 pub(crate) enum IncludeFetch {
     /// Use the network for missing or stale entries.
     Network { refresh: bool },
-    /// Never use the network. A missing remote entry is an error.
+    /// Never use the network or clone. A missing remote entry or Git clone is
+    /// an error.
     CacheOnly,
 }
 
@@ -681,12 +796,14 @@ two paths cannot drift.
   files.
 - `crates/prek/src/config/include.rs` (new): entry parsing, `IncludedConfig`,
   and collision checks.
-- `crates/prek/src/includes.rs` (new): fetching, cache, and freshness.
+- `crates/prek/src/includes.rs` (new): fetching, cache, freshness, and Git
+  include clones through `Store::clone_repos`.
 - `crates/prek/src/workspace.rs`: plans, `init_hooks`, and the
   `check_configs_staged` extension.
 - `crates/prek/src/hook.rs`: priority resolution input.
 - `crates/prek/src/cli/validate.rs`: async validation with includes.
-- `crates/prek/src/cli/cache_gc.rs`: include cache pruning and included repos.
+- `crates/prek/src/cli/cache_gc.rs`: include cache pruning, Git include clones,
+  and included repos.
 - `crates/prek/src/cli/completion.rs`: included hook ids.
 - `crates/prek/src/hooks/meta_hooks.rs`: included hooks in meta checks.
 - `crates/prek/src/cli/yaml_to_toml.rs`: `includes` conversion.
@@ -924,17 +1041,78 @@ Other commands:
 108. `mutable_rev_warning_names_include_source`.
 109. `unknown_key_warning_names_include_source`.
 
+### Unit tests: Git includes
+
+In `config/include.rs`:
+
+110. `parse_git_include_table`: `repo`, `rev`, and `path` in YAML and TOML.
+111. `reject_git_include_missing_rev`, `reject_git_include_missing_path`, and
+     `reject_rev_without_repo`.
+112. `reject_git_include_with_url`, and `reject_git_include_with_sha256`.
+113. `reject_git_include_special_repo`: `local`, `meta`, and `builtin`.
+114. `relative_include_path_rejects_escape`: `../x.yaml`, `a/../../x.yaml`,
+     `/abs.yaml`, and a Windows drive path. `a/./b.yaml` and `a/../b.yaml` are
+     accepted and normalized.
+115. `git_include_relative_repo_resolves_against_config_dir`.
+116. `reject_duplicate_git_include`: the same `(repo, rev, path)` twice, with
+     `path` spelled differently. The same `(repo, rev)` with two different
+     paths is accepted.
+117. `git_include_rejects_path_repo_inside_included_file`.
+118. `collision_git_include_vs_other_sources`: a `GitInclude` source against the
+     main config, a local include, and a remote include.
+119. `mutable_rev_warning_covers_git_include`: a branch `rev` is warned about
+     with the include source, and tags and SHAs are not.
+
+In `includes.rs`:
+
+120. `git_includes_cloned_in_one_batch`: two projects and three Git includes
+     over two `(repo, rev)` pairs produce two clones.
+121. `git_include_shares_clone_with_hook_repo`: the same `(repo, rev)` used as a
+     hook repository and as a Git include is cloned once.
+122. `cache_only_mode_git_include_missing_clone_is_error`: nothing is cloned.
+
+### Integration tests: Git includes
+
+These use the `create_repo` fixture from `tests/common/mod.rs`, which makes a
+local Git repository that works as a `repo:` source, so no server is needed.
+
+123. `git_include_runs_included_hooks`.
+124. `git_include_at_tag_and_sha`: two tags with different content, and each
+     `rev` runs its own hooks.
+125. `git_include_branch_rev_does_not_refresh`: new commits on the branch do not
+     change the hooks, with and without `--refresh`, and the mutable-`rev`
+     warning appears.
+126. `git_include_missing_path_is_error`: no hook runs.
+127. `git_include_path_escape_is_error`.
+128. `git_include_clone_failure_is_error`: a nonexistent repository, and no
+     hook runs.
+129. `git_include_works_offline_when_cloned`: the source repository is deleted
+     after the first run, and the second run succeeds.
+130. `git_include_collision_with_local_include_is_error`.
+131. `git_include_mixed_with_local_and_remote`: the order of the three source
+     kinds is kept.
+132. `workspace_shared_git_include_cloned_once`.
+133. `git_include_relative_repo_path`: `repo: ../shared-config` resolves
+     against the config directory, including with `--config`.
+134. `git_include_toml_file`: TOML chosen by the extension of `path`.
+135. `validate_config_with_git_include`: valid, missing path, and clone
+     failure.
+136. `update_ignores_git_include_rev`: `prek update` leaves the include `rev`
+     unchanged.
+
 Additions to existing test files:
 
 - `tests/cache.rs`: `cache_gc_keeps_referenced_include_entries`,
   `cache_gc_removes_unreferenced_include_entries` (after the include is
   removed from the config), `cache_gc_keeps_pinned_blob`,
-  `cache_gc_keeps_repos_referenced_by_includes`, and a `--dry-run --verbose`
-  output snapshot.
+  `cache_gc_keeps_repos_referenced_by_includes`,
+  `cache_gc_keeps_git_include_clone`,
+  `cache_gc_removes_git_include_clone_after_removal`, and a
+  `--dry-run --verbose` output snapshot.
 - `tests/yaml_to_toml.rs`: `yaml_to_toml_converts_includes`, covering string
-  and table entries with `sha256`.
+  entries, table entries with `sha256`, and Git include tables.
 - `tests/run/completion.rs`: `completion_offers_included_hook_ids`, with a
-  local include and a cached remote include.
+  local include, a cached remote include, and a cloned Git include.
 - `schema.rs::generate_json_schema`: regenerate `prek.schema.json` with
   `PREK_GENERATE=1` and review the new `includes` definition.
 
@@ -954,13 +1132,15 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | Stale fallback hides broken upstream | Tests 54 and 98. |
 | `prek update` writes to the wrong file | Test 106. |
 | GC deletes caches still in use | The `tests/cache.rs` additions. |
+| Git include reads files outside its checkout | Tests 114 and 127. |
+| Git includes change hook repository clone behavior | Tests 121 and 132, plus the existing clone and `try-repo` suites passing unchanged. |
 
 ## Documentation
 
 - `docs/reference/configuration.md`: a new "`includes`" section under top-level
   keys, with both formats, entry forms, path rules, the included file format,
-  hook order, collision rules, and caching. `repos` gets a note that included
-  hooks come first.
+  hook order, collision rules, caching, and Git includes. `repos` gets a note
+  that included hooks come first.
 - `docs/reference/environment-variables.md`: `PREK_INCLUDE_CACHE_TTL`.
 - `docs/security.md`: the section described in [Security](#security).
 - `docs/compatibility.md`: `includes` listed as `prek`-only.
@@ -974,9 +1154,11 @@ These guard existing behavior, and each maps to a risk this change introduces:
 - Overrides: letting the main config adjust `args`, `files`, or `stages` of an
   included hook by id, instead of redefining it.
 - Top-level settings scoped to the hooks of one include.
-- Private includes with a token from the environment or a credential helper.
-- `prek update --includes`, which writes `sha256` pins for remote includes and
-  bumps `rev`s in local included files.
+- Private HTTPS includes with a token from the environment. Git includes already
+  cover private sources.
+- `prek update --includes`, which writes `sha256` pins for remote includes,
+  bumps Git include `rev`s with the existing tag resolution and `--freeze`
+  logic, and bumps `rev`s in local included files.
 - A setting that requires every remote include to be pinned.
 - Include sources in `prek list --output-format=json`.
 - Nested includes, with cycle detection.
@@ -990,6 +1172,10 @@ These guard existing behavior, and each maps to a risk this change introduces:
   included files. Warning and ignoring them would let people include a full
   existing `.pre-commit-config.yaml`, as the example in the issue does, at the
   cost of silently different behavior.
+- **Relative repository paths inside Git includes.** This spec rejects them.
+  Resolving them against the checkout would allow hook repositories vendored
+  next to the shared config, but it would make a store path part of the
+  configuration.
 - **Hook order.** Includes before main follows reading order. Main-first would
   let project hooks such as formatters run before shared checks without
   explicit priorities.
