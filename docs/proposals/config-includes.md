@@ -117,10 +117,12 @@ current error messages.
 
 Each entry is either a string or a table.
 
-A string that starts with `https://` or `http://` is a remote include. Any other
-string is a local path. There is no other scheme detection, so a string like
-`file:///etc/x.yaml` or `git+https://...` is rejected instead of being treated
-as a path.
+A string is classified by one rule. If it matches
+`^[A-Za-z][A-Za-z0-9+.-]*://`, it is a URL: `https` makes a remote include,
+`http` does too when the rules in [Remote URL rules](#remote-url-rules) allow
+it, and any other scheme, such as `file://`, `git+https://`, or `s3://`, is a
+parse error. Every other string is a local path. Windows drive paths such as
+`C:\x.yaml` and `C:/x.yaml` do not match the URL pattern, so they stay paths.
 
 A table has one of three shapes:
 
@@ -141,8 +143,11 @@ Table rules, all enforced during parsing so errors carry a line and column:
   error.
 - `sha256` is only valid with `url`. With `path` it is an error because local
   files are already under the user's control and a digest would only go stale.
-  With `repo` it is an error because a commit SHA `rev` already pins the
-  content. See [Git includes](#git-includes).
+  With `repo` it is an error because Git includes are pinned through `rev`,
+  not through a digest. Only a commit SHA `rev` is an immutable pin: tags can be
+  moved by the repository maintainer, and branches do not pin anything. Use a
+  commit SHA, for example via `prek update --freeze`, when you need integrity
+  for a Git include. See [Freshness and pinning](#freshness-and-pinning).
 - Unknown keys in an include table are an error, not a warning. A typo like
   `sha265` would otherwise disable pinning without any visible sign.
 - `sha256` accepts 64 hex characters, case-insensitive, with an optional
@@ -160,8 +165,15 @@ Table rules, all enforced during parsing so errors carry a line and column:
   Private includes are future work.
 - The URL is parsed and normalized with `reqwest::Url`. The normalized form is
   used as the cache identity and in messages.
-- Redirects are followed with the shared client's policy. If the final URL is
-  plain `http` on a non-loopback host, the fetch fails.
+- Redirects are checked hop by hop, before the next request is sent. A redirect
+  policy is a property of the client, not of a request, so remote includes use
+  a dedicated client. It is built with the same settings as
+  `http::REQWEST_CLIENT` (TLS backend, custom certificates, proxy), plus a
+  `reqwest::redirect::Policy::custom` that refuses a hop to plain `http` on a
+  non-loopback host and a hop to a URL with user info, and keeps the default
+  limit of 10 hops. Checking only `response.url()` would be too late, because
+  the plaintext request would already have been sent. The final URL is checked
+  again after the response as a second guard.
 - The file format is chosen from the extension of the URL path, ignoring the
   query string and fragment. A `.toml` path is parsed as TOML. Everything else
   is parsed as YAML. This matches how `load_config` treats local files.
@@ -333,12 +345,24 @@ source of the same project. This covers:
 It also covers `meta` and `builtin` hooks. Two sources that both add
 `check-hooks-apply` collide.
 
-Collisions are detected from configuration data alone, since hook ids and
-aliases are written in the config, so no hook repository needs to be cloned
-first. Only Git include repositories are cloned before the check, because their
-files are the configuration data. Detection runs after all of a project's
-includes are resolved and before any hook repository is cloned or any hook is
-installed or run.
+Configuration data alone is not enough. A remote hook repository's manifest
+can set `alias` on a hook, and `HookSpec::from_remote` keeps that alias unless
+the configured hook overrides it. So detection runs in two passes, both before
+any hook is installed or run:
+
+1. **Configured names.** After all of a project's includes are resolved, the
+   configured `id`s and `alias`es are checked. This catches most collisions
+   early, including in `prek validate-config`, and needs no hook repository.
+   Only Git include repositories are cloned before this pass, because their
+   files are the configuration data.
+2. **Effective names.** After hook repositories are cloned and their manifests
+   read, `init_hooks` checks the effective selector names of the built hooks:
+   each hook's `id` plus its resolved `alias`, wherever that alias came from.
+   The error format is the same, and a manifest-provided name is marked
+   `(alias from manifest)`.
+
+`prek validate-config` runs only the first pass, because it does not clone hook
+repositories. The reference docs say so.
 
 Duplicate selector names **within one source** stay allowed. `pre-commit`
 allows listing the same hook twice with different arguments, and existing
@@ -424,9 +448,12 @@ Writes must be crash-safe and safe when several processes run at once:
 1. Stream the body into a temp file in the store scratch directory.
 2. Parse and validate the content as an included file. **Content that fails to
    parse or validate is never written to the cache.**
-3. Move the temp file to `blobs/<sha256>` with `fs::rename_with_retry`. If the
-   blob already exists, keep it. Blobs are immutable, so the existing file has
-   the same bytes.
+3. If `blobs/<sha256>` already exists and re-hashes to its name, keep it and
+   drop the temp file. Otherwise, whether the blob is missing or corrupt, move
+   the verified temp file onto `blobs/<sha256>` with `fs::rename_with_retry`,
+   which replaces an existing file atomically. On Windows, `std::fs::rename`
+   uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, and `rename_with_retry`
+   already retries the sharing violations antivirus scanners cause.
 4. Write the entry JSON to a temp file and rename it over
    `entries/<url-key>.json`.
 
@@ -515,10 +542,14 @@ store's existing repository clones instead of adding a new cache.
 - Each Git include becomes a `config::RemoteRepo` with no hooks, built with
   `RemoteRepo::new(repo, rev, Vec::new())`. Its store key, store path, and
   relative-source handling are the same as for a hook repository.
-- Git includes from all selected projects are cloned in one
-  `Store::clone_repos` batch. That gives parallel clones, the auth-failure retry
-  with terminal prompts outside CI, the `.prek-repo.json` marker, and crash-safe
-  persistence through `fs::rename_with_retry`, with no new code.
+- Git includes from all selected projects are deduplicated by `RemoteRepoKey`
+  first, the same way `remote_configs_to_clone` deduplicates hook repositories.
+  `Store::clone_repos` does not deduplicate its input, so passing duplicates
+  would clone the same `(repo, rev)` several times at once. The deduplicated
+  set is cloned in one `Store::clone_repos` batch. That gives parallel clones,
+  the auth-failure retry with terminal prompts outside CI, the
+  `.prek-repo.json` marker, and crash-safe persistence through
+  `fs::rename_with_retry`, with no new code.
 - A Git include and a hook repository with the same `(repo, rev)` share one
   clone. So do several Git includes that name different `path`s in the same
   `(repo, rev)`.
@@ -654,11 +685,11 @@ resolution, so editing one takes effect on the next run without `--refresh`.
 | `prek install` (shims only) | No resolution. `default_install_hook_types` comes from the main config only. |
 | `prek validate-config` | Resolves includes with network allowed and reports include errors and collisions. It becomes async. |
 | `prek update` | No include resolution. Updates `repos` and Git include `rev`s in the main config, see [`prek update` and Git includes](#prek-update-and-git-includes). Included files are never rewritten. |
-| `prek cache gc` | Cache-only resolution, see below. Never uses the network or clones. |
+| `prek cache gc` | Best-effort cache-only resolution, see below. Never uses the network or clones. |
 | `prek util yaml-to-toml` | Converts `includes` entries, both string and table forms. Included files are not converted or fetched. |
 | `prek try-repo` | Unaffected. The generated config has no includes. |
-| Shell completion | Cache-only resolution, best effort. Errors are ignored, and hooks from local, already cached remote, and already cloned Git includes are offered. |
-| `check-hooks-apply`, `check-useless-excludes` meta hooks | Cache-only resolution. The surrounding `run` has already populated the cache, so included hooks are checked too. |
+| Shell completion | Best-effort cache-only resolution. Missing sources are skipped, and hooks from local, already cached remote, and already cloned Git includes are offered. |
+| `check-hooks-apply`, `check-useless-excludes` meta hooks | Strict cache-only resolution. The surrounding `run` has already populated the cache, so a missing source is an error. |
 
 ### Staged configuration check
 
@@ -674,7 +705,8 @@ not need network resolution.
 `store.track_configs` keeps tracking main config files only. `prek cache gc`,
 for each tracked config that still exists:
 
-1. Parses its `includes` without network access.
+1. Parses its `includes` without network access, with best-effort cache-only
+   resolution.
 2. Keeps `entries/<url-key>.json` for every remote URL listed, and the blobs
    those entries name.
 3. Keeps `blobs/<pin>` for every pinned include.
@@ -684,10 +716,16 @@ for each tracked config that still exists:
    includes, so remote repositories and hook environments referenced only by
    included files are also kept.
 
-Entries and blobs that nothing references are removed. `--dry-run` and
-`--verbose` report them in an `includes` section, like other removed items. If
-a tracked config cannot be parsed, it is kept and its include cache is left
-alone, matching the current handling of unparseable configs.
+Entries, blobs, and Git include clones that nothing references are removed.
+`--dry-run` and `--verbose` report them in an `includes` section, like other
+removed items.
+
+Include cache keys are global, and `config-tracking.json` only records main
+config paths, so GC cannot tell which entries, blobs, or clones belonged to a
+config it cannot parse. If any tracked config, or any of its local or cached
+includes, fails to parse, GC skips the include sweep for that run: no include
+entries, include blobs, or Git include clones are removed. `--verbose` names the
+config that caused the skip. The other sweeps behave as they do today.
 
 ## Workspace behavior
 
@@ -724,8 +762,11 @@ configurations":
 - For Git includes, a commit SHA `rev` is the equivalent of a `sha256` pin. A
   tag can be moved by the repository maintainer, and a branch is not a pin.
 
-`prek` never runs hooks from a remote include whose content it could not
-verify against a pin, and it never runs hooks from content that failed to parse.
+For a pinned HTTPS include, `prek` never runs hooks from content whose digest
+does not match the pin. For any include, it never runs hooks from content that
+failed to parse. Unpinned HTTPS includes, and Git includes at a tag or branch,
+run whatever the source serves, so they are only as trustworthy as that
+source.
 
 ## Compatibility
 
@@ -803,8 +844,14 @@ pub(crate) enum IncludeFetch {
     /// Use the network for missing or stale entries.
     Network { refresh: bool },
     /// Never use the network or clone. A missing remote entry or Git clone is
-    /// an error.
+    /// an error. Used by the meta hooks, which run after `run` resolved
+    /// everything.
     CacheOnly,
+    /// Never use the network or clone. A missing remote entry or Git clone is
+    /// skipped and reported in the result, after its cache key or store key is
+    /// recorded. Used by shell completion and cache GC, where a valid config
+    /// may name sources that were never fetched.
+    CacheOnlyBestEffort,
 }
 
 /// The resolved configuration sources of one project, in hook order.
@@ -819,8 +866,9 @@ pub(crate) async fn resolve_includes(
 ) -> Result<Vec<ProjectSources>, IncludeError>;
 ```
 
-Cache-only resolution does no network I/O but shares the async signature. The
-two synchronous callers, shell completion and cache GC, use a small
+Both cache-only modes do no network I/O but share the async signature. The
+two synchronous callers, shell completion and cache GC, use
+`CacheOnlyBestEffort` through a small
 `resolve_includes_cached` wrapper that runs the same cache lookup and parse code
 without a runtime. The parse, validation, and collision code is shared, so the
 two paths cannot drift.
@@ -839,6 +887,10 @@ two paths cannot drift.
   the CLI already passes around.
 - `check_hook_collisions(sources: &[(ConfigSource, &[Repo])]) -> Result<(), IncludeError>`
   is a pure function, so it can be unit tested without any I/O.
+- The second collision pass runs in `build_hooks` once every hook is built and
+  before `init_hooks` returns, so no caller can install or run a hook first. It
+  checks each built `Hook`'s `id` and resolved `alias` and records which
+  source produced it.
 
 ### Update rewriting
 
@@ -1047,15 +1099,15 @@ Each test uses a temp `Store` and a local server.
 49. `pinned_hit_makes_no_request_even_with_refresh`.
 50. `pinned_miss_fetches_and_verifies`.
 51. `pinned_mismatch_is_error_and_not_cached`: no blob or entry is written.
-52. `pinned_corrupt_blob_refetches`: a tampered blob is replaced after a
-    successful fetch.
+52. `pinned_corrupt_blob_refetches`: after a successful fetch, the tampered
+    blob at the same path is replaced with the verified bytes.
 53. `pinned_corrupt_blob_offline_is_error`.
 54. `invalid_content_not_cached`: with a stale valid entry, a `200` with broken
     YAML is an error and the old entry and blob are untouched.
 55. `oversized_content_rejected`: rejected via `Content-Length` and via a
     chunked body with no length.
 56. `redirect_to_insecure_http_rejected`: the final-URL check, unit tested on
-    the helper.
+    the helper. The per-hop policy is covered by test 166.
 57. `corrupt_entry_json_is_miss`, and `unknown_entry_version_is_miss`.
 58. `concurrent_fetch_same_url_is_consistent`: two tasks fetch the same URL,
     and the final entry and blob agree.
@@ -1277,7 +1329,29 @@ tags:
 163. `update_workspace_git_includes`: two projects with the same include, each
      config updated.
 
-Additions to existing test files:
+### Tests added after review
+
+164. `collision_effective_names_second_pass` (unit): a manifest-provided alias
+     that matches an `id` in another source is caught by the second pass, and
+     the message marks it `(alias from manifest)`.
+165. `manifest_alias_collision_is_error` (integration): the error is reported
+     and no hook is installed or run.
+166. `redirect_hop_to_insecure_http_refused` (unit, `includes.rs`): the server
+     redirects to a non-loopback `http` URL, the policy refuses the hop, and no
+     request reaches the target. A hop to a URL with user info is refused too.
+167. `cache_only_best_effort_skips_missing_entry` (unit, `includes.rs`): a
+     missing remote entry is skipped and reported, and other includes still
+     resolve.
+168. `cache_only_best_effort_skips_missing_git_clone` (unit, `includes.rs`).
+169. `string_include_classification` (unit, `config/include.rs`): `C:\x.yaml`,
+     `C:/x.yaml`, and `a:b.yaml` are paths, and `file://`, `git+https://`, and
+     `s3://` strings are parse errors.
+170. `cache_gc_skips_git_clone_sweep_when_config_unparseable`
+     (`tests/cache.rs`): an unreferenced Git include clone survives GC while
+     any tracked config fails to parse.
+171. `cache_gc_skips_include_sweep_when_config_unparseable` (`tests/cache.rs`):
+     the same for include entries and blobs, with the `--verbose` reason in the
+     snapshot.
 
 Additions to existing test files:
 
@@ -1315,6 +1389,8 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | `prek update` modifies local include files | Test 106, plus a byte-for-byte check in test 153. |
 | GC deletes caches still in use | The `tests/cache.rs` additions. |
 | Git include reads files outside its checkout | Tests 114 and 127. |
+| Manifest aliases bypass collision checks | Tests 164 and 165. |
+| GC deletes caches of a config it cannot parse | Tests 170 and 171. |
 | Git includes change hook repository clone behavior | Tests 121 and 132, plus the existing clone and `try-repo` suites passing unchanged. |
 
 ## Delivery plan
@@ -1372,7 +1448,8 @@ any include support so the refactor can be reviewed against unchanged output.
   - a temporary `unsupported_include_source_is_error` test, which PRs 3 and 5
     replace with their positive tests,
   - `yaml_to_toml_converts_includes`, and the local part of
-    `completion_offers_included_hook_ids`.
+    `completion_offers_included_hook_ids`,
+  - review follow-ups 164, 165, and 169.
 
 ### PR 3: Git includes
 
@@ -1385,6 +1462,7 @@ any include support so the refactor can be reviewed against unchanged output.
   - `cache_gc_keeps_git_include_clone` and
     `cache_gc_removes_git_include_clone_after_removal`,
   - the Git part of `completion_offers_included_hook_ids`,
+  - review follow-ups 168 and 170,
   - the regression rows for checkout escapes and hook repository clones.
 
 ### PR 4: `prek update` for Git includes
@@ -1407,7 +1485,8 @@ any include support so the refactor can be reviewed against unchanged output.
   - integration tests 65, 67, 70, 76, 84 to 86, 91, and 93 to 98,
   - the remote parts of 99,
   - the include-cache tests in `tests/cache.rs`, and the remote part of
-    `completion_offers_included_hook_ids`.
+    `completion_offers_included_hook_ids`,
+  - review follow-ups 166, 167, and 171.
 
 ### Releases between PRs
 
