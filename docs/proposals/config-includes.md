@@ -202,8 +202,18 @@ Table rules, all enforced during parsing so errors carry a line and column:
 - `rev` accepts the same values as a hook repository's `rev`: a tag, a commit
   SHA, or a branch. A branch produces the existing mutable-`rev` warning.
 - `path` is relative to the repository root. It must not be absolute, and after
-  normalization it must not start with `..`. A `path` that escapes the checkout
-  is an error, so an include can never read files outside the clone.
+  normalization it must not start with `..`. This lexical check happens at parse
+  time.
+- No component of `path` may be a symlink in the repository tree, whether it is
+  the file itself or a parent directory. A lexical check alone is not enough:
+  ordinary reads follow symlinks, so a committed symlink could point outside the
+  clone. Resolution and `prek update` check this the same way, against the tree
+  at `rev` rather than the filesystem: `git ls-tree <rev> -- <prefix>` for each
+  prefix of `path` must report a tree (`040000`) for every parent and a regular
+  blob (`100644` or `100755`) for the file. A symlink (`120000`) or a submodule
+  (`160000`) anywhere is an error. The file is then read with
+  `git show <rev>:<path>`, so runtime resolution and update validation read
+  exactly the same bytes and never follow a link.
 - The file format is chosen by the extension of `path`, the same way as for
   local files.
 
@@ -388,11 +398,16 @@ are stable.
 
 ### Fetching
 
-- Remote includes are fetched with the shared `http::REQWEST_CLIENT`, so proxy
-  settings, `PREK_NATIVE_TLS`, `SSL_CERT_FILE`, and `SSL_CERT_DIR` behave as
-  they do for other downloads.
-- Each request has a 30 second total timeout, so an unreachable host fails
-  within bounded time instead of hanging a commit.
+- Remote includes are fetched with the dedicated client described in
+  [Remote URL rules](#remote-url-rules). It is built from the same settings as
+  `http::REQWEST_CLIENT`, so proxy settings, `PREK_NATIVE_TLS`,
+  `SSL_CERT_FILE`, and `SSL_CERT_DIR` behave as they do for other downloads,
+  along with the shared 30 second connect and read (inactivity) timeouts.
+- Each request also sets a 30 second total timeout with
+  `RequestBuilder::timeout`. The shared read timeout only fires when no bytes
+  arrive, so a server that keeps trickling data could otherwise hold a commit
+  indefinitely. The total timeout is a parameter of the fetch function so tests
+  can use a short value.
 - Responses larger than 1 MiB are rejected. The limit is checked against
   `Content-Length` when present and enforced while streaming.
 - Any status other than `200` is a failure, except `304` on a conditional
@@ -565,8 +580,10 @@ store's existing repository clones instead of adding a new cache.
 Store clones are immutable per `(repo, rev)`. Once the marker exists, the clone
 is never fetched again. Git includes inherit that behavior:
 
-- A tag or commit SHA `rev` is effectively pinned. A commit SHA is the strongest
-  pin, as described in the security guide for hook repositories.
+- Only a commit SHA `rev` is pinned. A tag `rev` stays fixed only while the
+  existing clone lives: if the maintainer moves the tag, a new clone on another
+  machine, in CI, or after `prek cache clean` gets the new content. Use a
+  commit SHA when you need the same content everywhere.
 - A branch `rev` does not follow the branch after the first clone. This matches
   hook repositories and triggers the same mutable-`rev` warning.
 - `--refresh` does not re-clone, again matching hook repositories.
@@ -683,7 +700,7 @@ resolution, so editing one takes effect on the next run without `--refresh`.
 | `prek exec` | Same as `run`. |
 | `prek install --prepare-hooks`, `prek prepare-hooks` | Same as `run`, so hook environments for included hooks are prepared. |
 | `prek install` (shims only) | No resolution. `default_install_hook_types` comes from the main config only. |
-| `prek validate-config` | Resolves includes with network allowed and reports include errors and collisions. It becomes async. |
+| `prek validate-config` | Resolves includes with network allowed and reports include errors and collisions. It becomes async, receives the `Store`, and holds `store.lock_async()` while resolving, the same way `run` does, because Git include clones and the include cache write to the shared store. |
 | `prek update` | No include resolution. Updates `repos` and Git include `rev`s in the main config, see [`prek update` and Git includes](#prek-update-and-git-includes). Included files are never rewritten. |
 | `prek cache gc` | Best-effort cache-only resolution, see below. Never uses the network or clones. |
 | `prek util yaml-to-toml` | Converts `includes` entries, both string and table forms. Included files are not converted or fetched. |
@@ -954,7 +971,8 @@ struct ConfigRevisions {
 - `evaluate_repo_target` dispatches on `UpdateRequirement`. `Hooks` calls
   `checkout_and_validate_manifest`, and `IncludeFile` calls a new
   `checkout_and_validate_include` next to it in `repository.rs`. That function
-  reads the file with `git show <rev>:<path>` and runs the included-file parser.
+  runs the same `git ls-tree` symlink check as resolution, reads the file with
+  `git show <rev>:<path>`, and runs the included-file parser.
 
 ### Touched files
 
@@ -968,7 +986,9 @@ struct ConfigRevisions {
 - `crates/prek/src/workspace.rs`: plans, `init_hooks`, and the
   `check_configs_staged` extension.
 - `crates/prek/src/hook.rs`: priority resolution input.
-- `crates/prek/src/cli/validate.rs`: async validation with includes.
+- `crates/prek/src/cli/validate.rs`: async validation with includes, taking the
+  `Store` and holding its lock during resolution.
+- `crates/prek/src/main.rs`: pass the `Store` to `validate_configs`.
 - `crates/prek/src/cli/cache_gc.rs`: include cache pruning, Git include clones,
   and included repos.
 - `crates/prek/src/cli/completion.rs`: included hook ids.
@@ -1352,6 +1372,18 @@ tags:
 171. `cache_gc_skips_include_sweep_when_config_unparseable` (`tests/cache.rs`):
      the same for include entries and blobs, with the `--verbose` reason in the
      snapshot.
+172. `git_include_symlink_file_is_error` (integration): `path` names a symlink
+     committed in the include repository that points outside the clone.
+173. `git_include_symlink_parent_is_error` (integration): a parent directory
+     of `path` is a symlink.
+174. `checkout_and_validate_include_rejects_symlink` (unit): a candidate tag
+     where `path` became a symlink is rejected by `prek update`.
+175. `remote_include_total_timeout` (unit, `includes.rs`): a server that keeps
+     sending one byte at a time fails once the (shortened) total timeout
+     passes, although no single read stalls.
+176. `validate_config_holds_store_lock` (integration): `validate-config` with a
+     Git include waits for a store lock held by another process, then
+     succeeds.
 
 Additions to existing test files:
 
@@ -1390,6 +1422,7 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | GC deletes caches still in use | The `tests/cache.rs` additions. |
 | Git include reads files outside its checkout | Tests 114 and 127. |
 | Manifest aliases bypass collision checks | Tests 164 and 165. |
+| A Git include reads outside the clone through a symlink | Tests 172 to 174. |
 | GC deletes caches of a config it cannot parse | Tests 170 and 171. |
 | Git includes change hook repository clone behavior | Tests 121 and 132, plus the existing clone and `try-repo` suites passing unchanged. |
 
@@ -1456,13 +1489,15 @@ any include support so the refactor can be reviewed against unchanged output.
 - [Git includes](#git-includes): cloning through `Store::clone_repos`, reading
   `path`, the resolution matrix, the `GitInclude` source, cache GC marking of
   include clones, and the Git parts of the security docs.
+- `validate-config` takes the `Store` and holds its lock during resolution. PR 3
+  is the first PR in which validation writes to the store.
 - Tests:
   - unit tests 118 to 122,
   - integration tests 123 to 135,
   - `cache_gc_keeps_git_include_clone` and
     `cache_gc_removes_git_include_clone_after_removal`,
   - the Git part of `completion_offers_included_hook_ids`,
-  - review follow-ups 168 and 170,
+  - review follow-ups 168, 170, 172, 173, and 176,
   - the regression rows for checkout escapes and hook repository clones.
 
 ### PR 4: `prek update` for Git includes
@@ -1471,7 +1506,7 @@ any include support so the refactor can be reviewed against unchanged output.
   `UpdateRequirement`, `checkout_and_validate_include`, Git include targets,
   repository selectors, and output labels. The rewriting side is already in
   place from PR 1.
-- Tests: 136 and 148 to 163.
+- Tests: 136, 148 to 163, and 174.
 
 ### PR 5: HTTPS includes
 
@@ -1486,7 +1521,7 @@ any include support so the refactor can be reviewed against unchanged output.
   - the remote parts of 99,
   - the include-cache tests in `tests/cache.rs`, and the remote part of
     `completion_offers_included_hook_ids`,
-  - review follow-ups 166, 167, and 171.
+  - review follow-ups 166, 167, 171, and 175.
 
 ### Releases between PRs
 
