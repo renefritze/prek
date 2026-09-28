@@ -4,8 +4,9 @@ This document specifies `includes`, a way for a project configuration to pull
 hook definitions from other configuration files. An include can be a local
 file, a remote file fetched over HTTPS, or a file inside a Git repository at a
 given revision. Remote includes are cached, and they can be pinned to a SHA-256
-digest of their content. Git includes reuse the store's repository clones and are
-pinned by their `rev`.
+digest of their content. Git includes reuse the store's repository clones. Only
+a full commit SHA `rev` pins a Git include: tags can be moved and branches
+change, see [Freshness and pinning](#freshness-and-pinning).
 
 Tracking issue: [j178/prek#1238](https://github.com/j178/prek/issues/1238).
 The design follows the direction discussed in
@@ -171,6 +172,11 @@ Table rules, all enforced during parsing so errors carry a line and column:
 - URLs with user info (`https://user:token@host/...`) are rejected. Credentials
   in a committed config file leak into logs, warnings, and the cache metadata.
   Private includes are future work.
+- URLs with a fragment (`https://host/a.yaml#x`) are rejected. HTTP never sends
+  the fragment, so two URLs that differ only in their fragment would make the
+  same request but get different cache identities, and fragments are a common
+  place to carry secrets that would then appear in messages and cache
+  metadata.
 - Query strings are allowed, because some hosts need them to select a ref or a
   raw view. They can still carry tokens, so every message and the `url` field
   of the cache entry show the URL with its query replaced by `?…`. The full
@@ -182,13 +188,37 @@ Table rules, all enforced during parsing so errors carry a line and column:
   a dedicated client. It is built with the same settings as
   `http::REQWEST_CLIENT` (TLS backend, custom certificates, proxy), plus a
   `reqwest::redirect::Policy::custom` that refuses a hop to plain `http`, and a
-  hop to a URL with user info, and keeps the default limit of 10 hops. A hop to
-  loopback `http` is allowed only when the configured URL is itself a loopback
-  URL, so a remote host cannot point `prek` at services on the user's machine. Checking only `response.url()` would be too late, because
-  the plaintext request would already have been sent. The final URL is checked
-  again after the response as a second guard.
+  hop to a URL with user info or a fragment, and keeps the default limit of 10
+  hops. Checking only `response.url()` would be too late, because the request
+  would already have been sent. The final URL is checked again after the
+  response as a second guard.
+- A remote host must not be able to point `prek` at services on the user's
+  machine or network, whatever the scheme. Every destination is classified as
+  **public** or **non-public**. Non-public means loopback (`127.0.0.0/8`,
+  `::1`, `localhost`), private (`10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `fc00::/7`), link-local (`169.254.0.0/16`, `fe80::/10`),
+  carrier-grade NAT (`100.64.0.0/10`), unspecified, multicast, broadcast, and
+  IPv4-mapped IPv6 forms of these. The configured URL decides what is allowed:
+  - If the configured host is public, every hop and every connection must be
+    public. The redirect policy refuses a hop whose host is a non-public IP
+    literal or `localhost`. Host names are checked where they are resolved: the
+    include client uses a custom `reqwest` DNS resolver
+    (`ClientBuilder::dns_resolver`) that drops non-public addresses and fails
+    the connection when none remain. Checking at connect time, instead of
+    resolving once in the redirect policy, also covers DNS rebinding.
+  - If the configured host is non-public, for example an intranet server or a
+    local development server, the include may be fetched, but redirects must
+    stay on the same host and port. A non-public include cannot hop to another
+    internal service.
+  - The configured host is classified once, by resolving it before the first
+    request. The two cases use two lazily built clients that share every other
+    setting.
+  - When an HTTP or HTTPS proxy is configured, the proxy resolves host names,
+    so the resolver filter cannot see the final address. The redirect-policy
+    checks on IP literals and `localhost` still apply, and the reference docs
+    say that further protection then relies on the proxy's own policy.
 - The file format is chosen from the extension of the URL path, ignoring the
-  query string and fragment. A `.toml` path is parsed as TOML. Everything else
+  query string. A `.toml` path is parsed as TOML. Everything else
   is parsed as YAML. This matches how `load_config` treats local files.
 
 ### Local path rules
@@ -615,10 +645,13 @@ of hand-running `curl | sha256sum`.
   fails like a hook repository whose candidate fails validation: the error is
   shown, the `sha256` is left unchanged, and the command exits with a failure
   status.
+- After a successful fetch and validation, the verified bytes are always stored
+  as `blobs/<sha256>` in the cache, whether or not the digest changed. An
+  unchanged pin whose blob was missing or corrupt is therefore repaired, and
+  the next run needs no network.
 - If the digest is unchanged, the include is reported as up to date. Otherwise
   the new `sha256` is written in place, keeping quote style and the optional
-  `sha256:` prefix, and the verified bytes are stored as `blobs/<sha256>` in the
-  cache, so the next run needs no network.
+  `sha256:` prefix.
 - Unpinned includes are not touched. `prek update` never adds a pin.
 - `--repo` and `--exclude-repo` match an HTTPS include by its normalized URL.
   Tag filters, `--freeze`, `--bleeding-edge`, and cooldowns do not apply,
@@ -847,6 +880,19 @@ an unstaged main config would. Local includes outside the worktree, remote
 includes, and Git includes are not checked. The check uses the parsed
 `includes` paths and does not need network resolution.
 
+A local include may be a symlink, or sit under a symlinked directory. Checking
+only the path as written would miss unstaged edits to the target, and checking
+only the target would miss an unstaged change to the link itself. So both are
+checked:
+
+- the lexical path as written, when it lies inside the worktree, which covers
+  the symlink entries, and
+- the canonical path (`dunce::canonicalize`), when it lies inside the worktree,
+  which covers the file that is actually read.
+
+Each path that lies outside the worktree is skipped, the same as a regular
+include outside the worktree.
+
 ### Cache GC
 
 `store.track_configs` keeps tracking main config files only. `prek cache gc`,
@@ -1067,6 +1113,20 @@ the mapping changes. This is required even apart from updating includes:
   the last column-0 `key:` line before it. Lines under `repos` map to remote
   repositories in order, and lines under `includes` map to Git includes in
   order, whichever section comes first in the file.
+- **YAML anchors and aliases:** a `rev` can live outside `repos`, for example in
+  `x-repo: &repo {repo: ..., rev: ...}` merged into a `repos` item with
+  `<<: *repo`. The current positional updater rewrites such a file correctly,
+  and section mapping would not. Anchors and aliases are detected from the YAML
+  parser's event stream (saphyr, which `serde_saphyr` builds on), not with a
+  regex, so `&` and `*` inside strings don't count. When a file contains any
+  anchor or alias:
+  - If it has no Git includes and no pinned HTTPS includes, the updater uses
+    today's positional mapping over all `rev:` lines. That is exactly the
+    current behavior, so no existing config regresses.
+  - Otherwise, `prek update` fails for that file with an error saying that
+    configs using YAML anchors or aliases can't be updated together with Git
+    include `rev`s or HTTPS pins, and suggesting inlining the anchored values.
+    Other config files in the workspace are still updated.
 - **TOML:** sites are found by structure with `toml_edit`: `[[repos]]` tables,
   inline tables in `includes = [...]`, and `[[includes]]` tables. The `rev =`
   detection in `read_frozen_refs` uses the same sections, so frozen comments
@@ -1587,7 +1647,8 @@ Elsewhere:
      entry JSON, and the cache key still distinguishes two queries.
 186. `redirect_to_loopback_only_from_loopback` (unit, `includes.rs`): a
      redirect from a non-loopback URL to `http://127.0.0.1` is refused before
-     the request is sent, and a loopback-to-loopback redirect is followed.
+     the request is sent, and a loopback redirect to the same host and port is
+     followed. Test 193 covers the other non-public cases.
 187. `future_fetched_at_is_stale` (unit, `includes.rs`): an entry fetched "in
      the future" is revalidated.
 188. `meta_hook_resolves_include_of_unselected_config` (integration):
@@ -1596,6 +1657,41 @@ Elsewhere:
 189. `validate_config_without_remote_includes_takes_no_lock` (integration):
      with only local includes, `validate-config` succeeds while another process
      holds the store lock.
+
+### Tests for the fourth review
+
+190. `reject_include_url_fragment` (unit, `config/include.rs`): string and
+     table forms with `#frag` are parse errors, and the error message does not
+     echo the fragment.
+191. `redirect_to_non_public_https_refused` (unit, `includes.rs`): from a
+     public configured URL, hops to `https://127.0.0.1`, `https://10.0.0.1`,
+     `https://169.254.169.254`, `https://[::1]`, `https://[fe80::1]`, and
+     `https://[::ffff:127.0.0.1]` are refused before any request is sent.
+192. `resolver_drops_non_public_addresses` (unit, `includes.rs`): a host name
+     that resolves only to non-public addresses fails to connect for a public
+     configured URL. A name with mixed addresses connects only to the public
+     ones.
+193. `non_public_configured_url_stays_on_host` (unit, `includes.rs`): a
+     loopback configured URL is fetched, a same-host redirect is followed, and a
+     redirect to another host or port is refused.
+194. `classify_destination` (unit, `includes.rs`): table-driven over every range
+     listed in [Remote URL rules](#remote-url-rules), including IPv4-mapped
+     IPv6.
+195. `update_pin_repairs_missing_blob` (unit, `cli/update/`): with an unchanged
+     digest and a deleted or corrupted blob, `prek update` reports up to date
+     and the blob exists and verifies afterwards. `--dry-run` still writes
+     nothing.
+196. `staged_check_symlinked_include` (integration): an unstaged change to the
+     symlink target inside the worktree blocks the run, an unstaged retarget of
+     the symlink blocks the run, and a symlink pointing outside the worktree
+     only checks the link.
+197. `update_yaml_anchor_rev_without_includes` (integration): a config whose
+     only `rev` comes from a merged anchor is updated exactly as today.
+198. `update_yaml_anchor_with_git_include_is_error` (integration): the same
+     config plus a Git include fails for that file with the anchor error, and a
+     second project in the workspace is still updated.
+199. `yaml_anchor_detection_ignores_strings` (unit, `cli/update/config.rs`):
+     `&` and `*` inside quoted values and comments are not treated as anchors.
 
 Additions to existing test files:
 
@@ -1638,6 +1734,9 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | GC deletes include caches of a config it cannot parse, or changes the `repos/` sweep | Tests 170 and 171. |
 | Git include reads fail for tag and branch revs | Test 122. |
 | `--freeze` corrupts TOML inline tables | Test 146. |
+| A remote include reaches services on the user's machine or network | Tests 191 to 194. |
+| Configs using YAML anchors stop updating | Test 197. |
+| An unstaged symlink change bypasses the clean-worktree check | Test 196. |
 | Unpinned content changes hooks silently | Tests 96 and 184. |
 | Tokens in include URLs leak into messages | Test 185. |
 | `validate-config` needs the store without remote includes | Test 189. |
@@ -1674,7 +1773,7 @@ visible difference is that configs with `rev:` lines under other top-level
 keys, such as an `x-` key holding YAML anchors, stop failing with a count
 mismatch, because those lines no longer count as repository sites.
 
-- Tests: 137 to 147. The rewriting functions work on file text, so these tests
+- Tests: 137 to 147, 197, and 199. The rewriting functions work on file text, so these tests
   do not need `includes` parsing.
 - Guard: every existing `tests/update.rs` snapshot stays byte-identical.
 
@@ -1704,7 +1803,7 @@ mismatch, because those lines no longer count as repository sites.
     replace with their positive tests,
   - `yaml_to_toml_converts_includes`, and the local part of
     `completion_offers_included_hook_ids`,
-  - review follow-ups 164, 165, and 169.
+  - review follow-ups 164, 165, 169, 190, and 196.
 - Scope note: the `prek update` warning for repositories in local includes
   lands here, with test 106.
 
@@ -1731,7 +1830,7 @@ mismatch, because those lines no longer count as repository sites.
   `UpdateRequirement`, `checkout_and_validate_include`, Git include targets,
   repository selectors, and output labels. The rewriting side is already in
   place from PR 1.
-- Tests: 136, 148 to 163, and 174.
+- Tests: 136, 148 to 163, 174, and 198.
 
 ### PR 5: HTTPS includes
 
@@ -1746,14 +1845,14 @@ mismatch, because those lines no longer count as repository sites.
   - the remote parts of 99,
   - the include-cache tests in `tests/cache.rs`, and the remote part of
     `completion_offers_included_hook_ids`,
-  - review follow-ups 166, 167, 171, 175, and 184 to 188.
+  - review follow-ups 166, 167, 171, 175, 184 to 188, and 191 to 194.
 
 ### PR 6: `prek update` for HTTPS pins
 
 - [`prek update` and HTTPS pins](#prek-update-and-https-pins): the
   `update_include_pins` step, `sha256` site mapping, the `pins` field of
   `ConfigRevisions`, selectors, and output lines.
-- Tests: 177 to 183.
+- Tests: 177 to 183, and 195.
 
 ### Releases between PRs
 
