@@ -157,7 +157,9 @@ Table rules, all enforced during parsing so errors carry a line and column:
   moved by the repository maintainer, and branches do not pin anything. Use a
   commit SHA, for example via `prek update --freeze`, when you need integrity
   for a Git include. See [Freshness and pinning](#freshness-and-pinning).
-- `private_network` is only valid with `url`, and must be a boolean.
+- `private_network` is only valid with `url`, must be a boolean, and is an
+  error when the URL's host is an IP literal or `localhost`, which are already
+  classified by address.
 - Unknown keys in an include table are an error, not a warning. A typo like
   `sha265` would otherwise disable pinning without any visible sign.
 - `sha256` accepts 64 hex characters, case-insensitive, with an optional
@@ -214,8 +216,10 @@ Table rules, all enforced during parsing so errors carry a line and column:
   - every other host name is public, unless its include entry sets
     `private_network = true`. That opt-in is how an intranet include behind a
     host name, for example `https://config.corp.example/base.yaml`, is
-    allowed. It is written in the main config, so it is reviewed like the rest
-    of the project configuration.
+    allowed. It needs the table form, because the string shorthand cannot
+    carry it. It is written in the main config, so it is reviewed like the rest
+    of the project configuration. On an IP literal or `localhost` it would be
+    redundant, so it is a parse error there.
 
   Classifying a host name from its current DNS answer instead would reopen DNS
   rebinding: a public name that later resolves only to a private address would
@@ -516,8 +520,12 @@ are stable.
   request that has a cached entry.
 - The SHA-256 of the response body is computed while streaming, with
   `checksum::HashReader`.
-- Within one `prek` process, each distinct normalized URL is fetched at most
-  once, even when several projects in a workspace include it. Distinct URLs are
+- Within one `prek` process, each distinct pair of normalized URL and trust
+  class (public, or non-public through `private_network` or a non-public
+  literal) is fetched at most once, even when several projects in a workspace
+  include it. Keying only by URL would let one project's `private_network`
+  opt-in decide which client fetches the URL for every other project, so the
+  result would depend on which project resolved first. Distinct pairs are
   fetched concurrently, bounded by the existing internal concurrency limit.
 
 ### Integrity pinning
@@ -556,8 +564,11 @@ $PREK_HOME/cache/prek/includes/
 └── blobs/<sha256>           # raw content, named by its digest
 ```
 
-`<url-key>` is the hex SHA-256 of the normalized URL string. An entry file
-looks like this:
+`<url-key>` is the hex SHA-256 of the normalized URL string. For an entry
+fetched with `private_network = true`, `#private` is appended to the URL before
+hashing. URLs with fragments are rejected, so this can't collide with a real
+URL, and content one project fetched from a private address is never served
+from the cache to a project without the opt-in. An entry file looks like this:
 
 ```json
 {
@@ -996,6 +1007,10 @@ configurations":
   that they are safe.
 - Credentials in include URLs are rejected. For private shared configuration,
   use a Git include, which authenticates through your Git credential setup.
+- A remote include cannot redirect `prek` to services on your machine or
+  network. Review every `private_network = true` entry: it lets that include's
+  host reach private addresses, and a proxy, when configured, makes its own
+  decisions about where host names lead.
 - For Git includes, a full commit SHA `rev` is the equivalent of a `sha256`
   pin, and `prek update --freeze` writes one. A tag can be moved by the
   repository maintainer, and a branch is not a pin.
@@ -1730,8 +1745,8 @@ Elsewhere:
 
 200. `private_network_requires_opt_in` (unit, `includes.rs`): a host name that
      resolves only to `10.0.0.1` fails to connect without `private_network`,
-     and is fetched with it. `private_network` with `path` or `repo` is a parse
-     error.
+     and is fetched with it. `private_network` with `path` or `repo`, or on an
+     IP literal or `localhost` URL, is a parse error.
 201. `rebinding_after_first_fetch_refused` (unit, `includes.rs`): a host name
      that resolves to a public address on the first fetch and to `127.0.0.1`
      on revalidation is refused on revalidation, and the stale fallback
@@ -1747,6 +1762,11 @@ Elsewhere:
 205. `untracked_symlink_include_blocks_run` (integration): an untracked symlink
      to a tracked include, and a tracked symlink to an untracked file, both fail
      the check.
+206. `fetch_dedup_keys_on_trust_class` (unit, `includes.rs`): two projects
+     include the same URL, one with `private_network = true` and one without.
+     Each is fetched with its own client, the project without the opt-in fails
+     on a private address whatever the resolution order, and two projects with
+     the same trust class share one request.
 
 Additions to existing test files:
 
@@ -1758,7 +1778,8 @@ Additions to existing test files:
   `cache_gc_removes_git_include_clone_after_removal`, and a
   `--dry-run --verbose` output snapshot.
 - `tests/yaml_to_toml.rs`: `yaml_to_toml_converts_includes`, covering string
-  entries, table entries with `sha256`, and Git include tables.
+  entries, table entries with `sha256` or `private_network`, and Git include
+  tables.
 - `tests/run/completion.rs`: `completion_offers_included_hook_ids`, with a
   local include, a cached remote include, and a cloned Git include.
 - `schema.rs::generate_json_schema`: regenerate `prek.schema.json` with
@@ -1794,6 +1815,7 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | An unstaged symlink change bypasses the clean-worktree check | Test 196. |
 | An untracked local include bypasses the clean-worktree check | Tests 204 and 205. |
 | DNS answers change a remote include's trust class | Tests 200 and 201. |
+| One project's `private_network` opt-in applies to another project | Test 206. |
 | A stalled resolver blocks a commit | Test 202. |
 | Unpinned content changes hooks silently | Tests 96 and 184. |
 | Tokens in include URLs leak into messages | Test 185. |
@@ -1903,8 +1925,8 @@ mismatch, because those lines no longer count as repository sites.
   - the remote parts of 99,
   - the include-cache tests in `tests/cache.rs`, and the remote part of
     `completion_offers_included_hook_ids`,
-  - review follow-ups 166, 167, 171, 175, 184 to 188, 191 to 194, and 200 to
-    203.
+  - review follow-ups 166, 167, 171, 175, 184 to 188, 191 to 194, 200 to
+    203, and 206.
 
 ### PR 6: `prek update` for HTTPS pins
 
