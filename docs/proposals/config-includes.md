@@ -30,6 +30,29 @@ Taskfiles, GitLab CI has `include:`, and Renovate has shareable presets. `prek`
 should let a configuration say "these hooks come from that file" and then treat
 the result as one project configuration.
 
+## Open questions
+
+- **TTL default.** One hour matches the workspace cache and keeps commits
+  offline-friendly. A longer default reduces request volume for large teams,
+  and a shorter one propagates upstream changes faster.
+- **Forbidden keys versus warnings.** This spec rejects project-level keys in
+  included files. Warning and ignoring them would let people include a full
+  existing `.pre-commit-config.yaml`, as the example in the issue does, at the
+  cost of silently different behavior.
+- **Relative repository paths inside Git includes.** This spec rejects them.
+  Resolving them against the checkout would allow hook repositories vendored
+  next to the shared config, but it would make a store path part of the
+  configuration.
+- **Hook order.** Includes before main follows reading order. Main-first would
+  let project hooks such as formatters run before shared checks without
+  explicit priorities, and would keep the implicit priorities of main-config
+  hooks stable when an include changes, at the cost of shifting the included
+  hooks instead.
+- **Invalid upstream content.** This spec falls back to the cached copy with a
+  warning, which keeps commits working but lets a broken shared file go
+  unnoticed by anyone who ignores warnings. The alternative is a hard error,
+  which makes an upstream typo an outage for every consumer.
+
 ## Goals
 
 - Include hook definitions from one or more files, listed in order.
@@ -1295,478 +1318,475 @@ For unit tests in `includes.rs`, extend the existing `serve_once` pattern into
 a `serve_sequence` helper that answers a fixed list of responses and records
 requests.
 
-### Unit tests: `config/include.rs`
+### Unit tests
 
-Parsing, each in YAML and TOML unless marked:
+#### Include entry parsing
 
-1. `parse_include_string_local_relative`: `ci/a.yaml` becomes `Local`, resolved
-   against the config directory after `load_config`.
-2. `parse_include_string_local_absolute` and `parse_include_string_tilde`.
-3. `parse_include_string_https`: becomes `Remote` with no pin.
-4. `parse_include_table_url_with_sha256`: lowercase, uppercase, and
-   `sha256:`-prefixed digests parse to the same value.
-5. `parse_include_table_path`.
-6. `reject_include_table_path_and_url`: positioned error snapshot.
-7. `reject_include_table_without_location`.
-8. `reject_include_sha256_with_path`.
-9. `reject_include_invalid_sha256`: too short, non-hex, and 65 characters.
-10. `reject_include_unknown_table_key`: `sha265` is rejected with a positioned
-    error. This is a regression guard for silently lost pins.
-11. `reject_include_insecure_http`: `http://example.com/a.yaml`.
-12. `allow_include_loopback_http`: `localhost`, `127.0.0.1:8080`, `[::1]`.
-13. `reject_include_other_schemes`: `file://`, `ftp://`, `git+https://`.
-14. `reject_include_userinfo`: `https://u:p@host/a.yaml`.
-15. `reject_include_empty`: `""` and `{ path = "" }`.
-16. `config_without_includes_defaults_empty`: regression guard. The existing
-    `parse_repos` debug snapshots gain `includes: []` and are regenerated once.
-17. `include_format_from_url_path`: `a.toml`, `a.toml?token=x`, `a.yaml`, `a`,
-    and `a.TOML`.
+`config/include.rs`. Each test runs in YAML and TOML unless it says otherwise.
 
-Included file validation:
+- `parse_include_string_local_relative`: `ci/a.yaml` becomes `Local`, resolved
+  against the config directory after `load_config`.
+- `parse_include_string_local_absolute` and `parse_include_string_tilde`.
+- `parse_include_string_https`: becomes `Remote` with no pin.
+- `parse_include_table_url_with_sha256`: lowercase, uppercase, and
+  `sha256:`-prefixed digests parse to the same value.
+- `parse_include_table_path`.
+- `reject_include_table_path_and_url`: positioned error snapshot.
+- `reject_include_table_without_location`.
+- `reject_include_sha256_with_path`.
+- `reject_include_invalid_sha256`: too short, non-hex, and 65 characters.
+- `reject_include_unknown_table_key`: `sha265` is rejected with a positioned
+  error. This is a regression guard for silently lost pins.
+- `reject_include_insecure_http`: `http://example.com/a.yaml`.
+- `allow_include_loopback_http`: `localhost`, `127.0.0.1:8080`, `[::1]`.
+- `reject_include_other_schemes`: `file://`, `ftp://`, `git+https://`.
+- `reject_include_userinfo`: `https://u:p@host/a.yaml`.
+- `reject_include_empty`: `""` and `{ path = "" }`.
+- `string_include_classification`: `C:\x.yaml`, `C:/x.yaml`, and `a:b.yaml` are
+  paths, and `file://`, `git+https://`, and `s3://` strings are parse errors.
+- `reject_include_url_fragment`: string and table forms with `#frag` are parse
+  errors, and the error message does not echo the fragment.
+- `include_format_from_url_path`: `a.toml`, `a.toml?token=x`, `a.yaml`, `a`, and
+  `a.TOML`.
+- `config_without_includes_defaults_empty`: regression guard. The existing
+  `parse_repos` debug snapshots gain `includes: []` and are regenerated once.
+- `parse_git_include_table`: `repo`, `rev`, and `path` in YAML and TOML.
+- `reject_git_include_missing_rev`, `reject_git_include_missing_path`, and
+  `reject_rev_without_repo`.
+- `reject_git_include_with_url` and `reject_git_include_with_sha256`.
+- `reject_git_include_special_repo`: `local`, `meta`, and `builtin`.
+- `relative_include_path_rejects_escape`: `../x.yaml`, `a/../../x.yaml`,
+  `/abs.yaml`, and a Windows drive path. `a/./b.yaml` and `a/../b.yaml` are
+  accepted and normalized.
+- `git_include_relative_repo_resolves_against_config_dir`.
 
-18. `included_config_allows_repos_priorities_minimum_version`.
-19. `included_config_rejects_each_forbidden_key`: table-driven over
-    `FORBIDDEN_INCLUDE_KEYS`, asserting the key and source appear in the error.
-20. `included_config_rejects_nested_includes`: dedicated message.
-21. `included_config_ignores_ci_and_extension_keys`: no unused-key warning.
-22. `included_config_collects_unknown_keys`: paths such as `repos[0].foo` are
-    reported against the include source.
-23. `included_config_requires_repos`.
-24. `included_config_minimum_version_too_new`: uses `VERSION_FILTER`.
-25. `included_priority_alias_scoped_to_file`: an include alias works, an alias
-    from the main config is rejected in the include, and the reverse is also
-    rejected.
-26. `remote_include_rejects_path_repo`: relative, absolute, and Windows drive
-    paths, and `file://` URLs.
-27. `remote_include_allows_url_and_special_repos`: `https://`, `ssh://`,
-    SCP-style, `local`, `meta`, `builtin`.
-28. `local_include_resolves_relative_repo_against_include_dir`.
+#### Duplicate and self includes
 
-Duplicates:
+`config/include.rs`.
 
-29. `reject_duplicate_local_include`: `./a.yaml` and `a.yaml`.
-30. `reject_duplicate_remote_include`: URLs equal after normalization, such as
-    host case and a default port.
-31. `reject_self_include`.
+- `reject_duplicate_local_include`: `./a.yaml` and `a.yaml`.
+- `reject_duplicate_remote_include`: URLs equal after normalization, such as
+  host case and a default port.
+- `reject_self_include`.
+- `reject_duplicate_git_include`: the same `(repo, rev, path)` twice, with
+  `path` spelled differently. The same `(repo, rev)` with two different paths is
+  accepted.
 
-Collisions (`check_hook_collisions`, pure):
+#### Included file validation
 
-32. `no_collision_distinct_ids`.
-33. `collision_include_vs_main`.
-34. `collision_between_includes`.
-35. `collision_alias_vs_id`, in both directions.
-36. `collision_alias_vs_alias`.
-37. `collision_meta_hooks`.
-38. `duplicate_within_one_source_allowed`: regression guard for `pre-commit`
-    behavior.
-39. `collision_error_lists_all_names_in_definition_order`: snapshot of the
-    whole message.
-40. `collision_ignores_hook_name`: equal `name` values with different `id`s are
-    fine.
+`config/include.rs`.
 
-### Unit tests: `includes.rs`
+- `included_config_allows_repos_priorities_minimum_version`.
+- `included_config_rejects_each_forbidden_key`: table-driven over
+  `FORBIDDEN_INCLUDE_KEYS`, asserting the key and source appear in the error.
+- `included_config_rejects_nested_includes`: dedicated message.
+- `included_config_ignores_ci_and_extension_keys`: no unused-key warning.
+- `included_config_collects_unknown_keys`: paths such as `repos[0].foo` are
+  reported against the include source.
+- `included_config_requires_repos`.
+- `included_config_minimum_version_too_new`: uses `VERSION_FILTER`.
+- `included_priority_alias_scoped_to_file`: an include alias works, an alias
+  from the main config is rejected in the include, and the reverse is also
+  rejected.
+- `remote_include_rejects_path_repo`: relative, absolute, and Windows drive
+  paths, and `file://` URLs.
+- `remote_include_allows_url_and_special_repos`: `https://`, `ssh://`,
+  SCP-style, `local`, `meta`, `builtin`.
+- `local_include_resolves_relative_repo_against_include_dir`.
+- `git_include_rejects_path_repo_inside_included_file`: a relative path, an
+  absolute path, and a `file://` URL.
+- `mutable_rev_warning_covers_git_include`: the existing heuristic applies to
+  Git include `rev`s, and the warning names the include source. `main` is warned
+  about, and `v1.4.0` and a SHA are not.
 
-Each test uses a temp `Store` and a local server.
+#### Hook collisions
 
-41. `fetch_miss_populates_cache`: the entry and blob exist, and the blob name
-    equals its digest.
-42. `fresh_entry_makes_no_request`: the server records zero requests.
-43. `stale_entry_revalidates_with_conditional_headers`: `If-None-Match` and
-    `If-Modified-Since` are sent. A `304` bumps `fetched_at` and keeps the blob.
-44. `stale_entry_replaced_on_200`.
-45. `stale_entry_network_failure_falls_back`: returns a `Stale` outcome carrying
-    the age and the cause.
-46. `miss_network_failure_is_error`: connection refused.
-47. `miss_http_error_is_error`: 404 and 500, with the status in the error.
-48. `refresh_revalidates_fresh_unpinned`.
-49. `pinned_hit_makes_no_request_even_with_refresh`.
-50. `pinned_miss_fetches_and_verifies`.
-51. `pinned_mismatch_is_error_and_not_cached`: no blob or entry is written.
-52. `pinned_corrupt_blob_refetches`: after a successful fetch, the tampered
-    blob at the same path is replaced with the verified bytes.
-53. `pinned_corrupt_blob_offline_is_error`.
-54. `invalid_content_not_cached`: with a stale valid entry, a `200` with broken
-    YAML returns a `Stale` outcome carrying the parse error, and the old entry
-    and blob are untouched. Without a cached entry, the same response is an
-    error and nothing is written.
-55. `oversized_content_rejected`: rejected via `Content-Length` and via a
-    chunked body with no length.
-56. `redirect_to_insecure_http_rejected`: the final-URL check, unit tested on
-    the helper. The per-hop policy is covered by test 166.
-57. `corrupt_entry_json_is_miss`, and `unknown_entry_version_is_miss`.
-58. `concurrent_fetch_same_url_is_consistent`: two tasks fetch the same URL,
-    and the final entry and blob agree.
-59. `fetch_deduplicated_within_process`: two projects including one URL produce
-    one request.
-60. `cache_key_uses_normalized_url`.
-61. `ttl_from_env`: default, `0`, a valid value, and an invalid value that warns
-    and uses the default.
-62. `cache_only_mode_never_requests`: a stale entry is used without a warning,
-    and the server records zero requests.
+`check_hook_collisions` in `config/include.rs`, a pure function.
 
-### Integration tests: `crates/prek/tests/includes.rs` (new)
+- `no_collision_distinct_ids`.
+- `collision_include_vs_main`.
+- `collision_between_includes`.
+- `collision_alias_vs_id`, in both directions.
+- `collision_alias_vs_alias`.
+- `collision_meta_hooks`.
+- `duplicate_within_one_source_allowed`: regression guard for `pre-commit`
+  behavior.
+- `collision_error_lists_all_names_in_definition_order`: snapshot of the whole
+  message.
+- `collision_ignores_hook_name`: equal `name` values with different `id`s are
+  fine.
+- `collision_git_include_vs_other_sources`: a `GitInclude` source against the
+  main config, a local include, and a remote include.
 
-All of these use `cmd_snapshot!`. Tests that check that hooks did not run use a
+#### Remote cache and freshness
+
+`includes.rs`. These tests and the other `includes.rs` groups use a temp `Store`
+and a local server.
+
+- `fetch_miss_populates_cache`: the entry and blob exist, and the blob name
+  equals its digest.
+- `fresh_entry_makes_no_request`: the server records zero requests.
+- `stale_entry_revalidates_with_conditional_headers`: `If-None-Match` and
+  `If-Modified-Since` are sent. A `304` bumps `fetched_at` and keeps the blob.
+- `stale_entry_replaced_on_200`.
+- `stale_entry_network_failure_falls_back`: returns a `Stale` outcome carrying
+  the age and the cause.
+- `refresh_revalidates_fresh_unpinned`.
+- `future_fetched_at_is_stale`: an entry fetched "in the future" is revalidated.
+- `corrupt_entry_json_is_miss` and `unknown_entry_version_is_miss`.
+- `concurrent_fetch_same_url_is_consistent`: two tasks fetch the same URL, and
+  the final entry and blob agree.
+- `cache_key_uses_normalized_url`.
+- `ttl_from_env`: default, `0`, a valid value, and an invalid value that warns
+  and uses the default.
+- `query_string_redacted`: a URL with `?token=secret` does not show the token in
+  the stale warning, the fetch error, or the entry JSON, and the cache key still
+  distinguishes two queries.
+- `cache_only_mode_never_requests`: a stale entry is used without a warning, and
+  the server records zero requests.
+- `cache_only_skips_missing_entry`: a missing remote entry is skipped and
+  reported, and other includes still resolve.
+
+#### Remote pinning
+
+`includes.rs`.
+
+- `pinned_hit_makes_no_request_even_with_refresh`.
+- `pinned_miss_fetches_and_verifies`.
+- `pinned_mismatch_is_error_and_not_cached`: no blob or entry is written.
+- `pinned_corrupt_blob_refetches`: after a successful fetch, the tampered blob
+  at the same path is replaced with the verified bytes.
+- `pinned_corrupt_blob_offline_is_error`.
+
+#### Remote fetch failures and limits
+
+`includes.rs`.
+
+- `miss_network_failure_is_error`: connection refused.
+- `miss_http_error_is_error`: 404 and 500, with the status in the error.
+- `invalid_content_not_cached`: with a stale valid entry, a `200` with broken
+  YAML returns a `Stale` outcome carrying the parse error, and the old entry and
+  blob are untouched. Without a cached entry, the same response is an error and
+  nothing is written.
+- `oversized_content_rejected`: rejected via `Content-Length` and via a chunked
+  body with no length.
+- `remote_include_total_timeout`: a server that keeps sending one byte at a time
+  fails once the (shortened) total timeout passes, although no single read
+  stalls. With a stale cached entry, the shorter revalidation timeout applies
+  and the result is a `Stale` outcome.
+- `outer_deadline_covers_dns`: a resolver that never answers makes the fetch
+  fail at the (shortened) total deadline.
+
+#### Redirects and private networks
+
+`includes.rs`.
+
+- `classify_destination`: table-driven over every range listed in [Remote URL
+  rules](#remote-url-rules), including IPv4-mapped IPv6.
+- `redirect_to_insecure_http_rejected`: the final-URL check, unit tested on the
+  helper. `redirect_hop_to_insecure_http_refused` covers the per-hop policy.
+- `redirect_hop_to_insecure_http_refused`: the server redirects to a
+  non-loopback `http` URL, the policy refuses the hop, and no request reaches
+  the target. A hop to a URL with user info is refused too.
+- `redirect_to_loopback_only_from_loopback`: a redirect from a non-loopback URL
+  to `http://127.0.0.1` is refused before the request is sent, and a loopback
+  redirect to the same host and port is followed.
+  `non_public_configured_url_stays_on_host` covers the other non-public cases.
+- `loopback_http_redirect_same_port_only`: from a loopback `http` URL, a
+  redirect to the same host and port is followed, and a redirect to plain `http`
+  on another port is refused. From a public `https` URL, any `http` hop is
+  refused.
+- `redirect_to_non_public_https_refused`: from a public configured URL, hops to
+  `https://127.0.0.1`, `https://10.0.0.1`, `https://169.254.169.254`,
+  `https://[::1]`, `https://[fe80::1]`, and `https://[::ffff:127.0.0.1]` are
+  refused before any request is sent.
+- `resolver_drops_non_public_addresses`: a host name that resolves only to
+  non-public addresses fails to connect for a public configured URL. A name with
+  mixed addresses connects only to the public ones.
+- `non_public_configured_url_stays_on_host`: a loopback configured URL is
+  fetched, a same-host redirect is followed, and a redirect to another host or
+  port is refused.
+- `private_network_requires_opt_in`: a host name that resolves only to
+  `10.0.0.1` fails to connect without `private_network`, and is fetched with it.
+  `private_network` with `path` or `repo`, or on an IP literal or `localhost`
+  URL, is a parse error.
+- `rebinding_after_first_fetch_refused`: a host name that resolves to a public
+  address on the first fetch and to `127.0.0.1` on revalidation is refused on
+  revalidation, and the stale fallback applies.
+
+#### Fetch deduplication
+
+`includes.rs`.
+
+- `fetch_deduplicated_within_process`: two projects including one URL produce
+  one request.
+- `fetch_dedup_keys_on_trust_class`: two projects include the same URL, one with
+  `private_network = true` and one without. Each is fetched with its own client,
+  the project without the opt-in fails on a private address whatever the
+  resolution order, and two projects with the same trust class share one
+  request.
+
+#### Git include resolution
+
+`includes.rs`.
+
+- `git_includes_cloned_in_one_batch`: two projects and three Git includes over
+  two `(repo, rev)` pairs produce two clones.
+- `git_include_shares_clone_with_hook_repo`: the same `(repo, rev)` used as a
+  hook repository and as a Git include is cloned once.
+- `git_include_reads_head_of_shallow_clone`: a Git include at a tag and one at a
+  branch are cloned through the shallow path, where neither name exists as a
+  local ref, and `path` is read from `HEAD`. This guards against using `rev` as
+  the tree-ish.
+- `cache_only_skips_missing_git_clone`.
+
+#### `prek update` rewriting
+
+`cli/update/config.rs`. These functions work on file text.
+
+- `yaml_rev_sites_includes_before_repos`: each `rev:` line maps to the right
+  entry.
+- `yaml_rev_sites_includes_after_repos`.
+- `yaml_rev_sites_git_includes_only`: no remote repositories.
+- `yaml_rev_sites_ignore_non_git_includes`: string, local, and remote entries
+  next to one Git include, and only its line counts.
+- `yaml_flow_style_git_include_skipped`: the result says include revisions can't
+  be updated, and repository revisions are still rewritten.
+- `yaml_include_rev_keeps_quotes_and_comment`: quote style and a trailing
+  non-frozen comment are kept.
+- `yaml_include_rev_frozen_comment_spacing`: an existing `# frozen:` spacing is
+  kept, and the default spacing is used for a new one.
+- `toml_rev_sites_inline_includes`.
+- `toml_rev_sites_array_of_tables_includes`: `[[includes]]`.
+- `toml_include_rev_frozen_comment`: an `[[includes]]` table gets the
+  `# frozen:` comment. Under `--freeze`, an inline-table Git include keeps its
+  `rev` and produces the warning, and the output still parses as TOML.
+- `read_frozen_refs_is_section_aware`: YAML and TOML with `rev` sites in both
+  sections.
+- `sha256_sites_map_to_pinned_includes`: YAML and TOML, with unpinned and Git
+  includes in between. A flow-style pinned entry is skipped with the warning.
+- `yaml_anchor_detection_ignores_strings`: `&` and `*` inside quoted values and
+  comments are not treated as anchors.
+
+#### `prek update` targets and validation
+
+`cli/update/source.rs` and `cli/update/repository.rs`.
+
+- `hook_repo_and_git_include_share_repo_source`: one `RepoSource` and two
+  targets.
+- `git_include_uses_repo_update_settings`: `update.repos.<repo>` cooldown and
+  tag filters apply.
+- `checkout_and_validate_include_missing_path`: the candidate is rejected.
+- `checkout_and_validate_include_invalid_file`: a forbidden key and a parse
+  error at the candidate tag are rejected.
+- `checkout_and_validate_include_valid`.
+- `checkout_and_validate_include_rejects_symlink`: a candidate tag where `path`
+  became a symlink is rejected by `prek update`.
+- `update_pin_repairs_missing_blob`: with an unchanged digest and a deleted or
+  corrupted blob, `prek update` reports up to date and the blob exists and
+  verifies afterwards. `--dry-run` still writes nothing.
+
+### Integration tests
+
+New tests live in `crates/prek/tests/includes.rs` unless a group says otherwise.
+All of them use `cmd_snapshot!`. Tests that check that hooks did not run use a
 local hook that writes a marker file, and assert the file is absent.
 
-Basic behavior:
+#### Basic behavior
 
-63. `local_include_runs_included_hooks`.
-64. `multiple_includes_run_in_listed_order_before_main`: sequential output
-    order in the snapshot.
-65. `mixed_local_and_remote_includes`.
-66. `toml_main_includes_yaml_and_yaml_main_includes_toml`.
-67. `remote_toml_include_by_extension`.
-68. `include_with_empty_repos`.
-69. `included_local_hook_entry_runs_from_project_root`: the entry script sits
-    next to the project, not next to the include.
-70. `remote_include_with_remote_repo`: a served include references
-    `https://example.invalid/hooks`, and the test's global Git configuration
-    maps that URL to a `create_hook_repo` fixture with `url.<base>.insteadOf`.
-    The repo is cloned and the hook runs. This also covers the documented way
-    to use local mirrors, since `file://` is rejected in remote includes.
-71. `include_applies_main_top_level_settings`: the main config's `exclude` and
-    `default_stages` affect included hooks.
-72. `include_priorities_schedule_across_sources`: aliases from the include and
-    numbers from the main config interleave as expected. A second step adds a
-    hook to the include and snapshots how the implicit priorities of main-config
-    hooks shift, which is the behavior the reference docs describe.
+- `local_include_runs_included_hooks`.
+- `multiple_includes_run_in_listed_order_before_main`: sequential output order
+  in the snapshot.
+- `mixed_local_and_remote_includes`.
+- `toml_main_includes_yaml_and_yaml_main_includes_toml`.
+- `remote_toml_include_by_extension`.
+- `include_with_empty_repos`.
+- `included_local_hook_entry_runs_from_project_root`: the entry script sits next
+  to the project, not next to the include.
+- `remote_include_with_remote_repo`: a served include references
+  `https://example.invalid/hooks`, and the test's global Git configuration maps
+  that URL to a `create_hook_repo` fixture with `url.<base>.insteadOf`. The repo
+  is cloned and the hook runs. This also covers the documented way to use local
+  mirrors, since `file://` is rejected in remote includes.
+- `include_applies_main_top_level_settings`: the main config's `exclude` and
+  `default_stages` affect included hooks.
+- `include_priorities_schedule_across_sources`: aliases from the include and
+  numbers from the main config interleave as expected. A second step adds a hook
+  to the include and snapshots how the implicit priorities of main-config hooks
+  shift, which is the behavior the reference docs describe.
 
-Paths and workspace:
+#### Paths and workspace
 
-73. `include_relative_to_config_not_cwd`: run from a subdirectory with `--cd`.
-74. `include_with_explicit_config_flag`: `--config other/cfg.yaml` resolves
-    includes relative to `other/`.
-75. `workspace_project_includes_shared_file`: `a/` and `b/` both include
-    `../shared.yaml`, and each gets its own hooks with no collision.
-76. `workspace_shared_remote_include_fetched_once`: the server sees one request.
-77. `workspace_broken_include_in_unselected_project`: `prek run a/` succeeds
-    while `b/` has a missing include.
-78. `editing_local_include_takes_effect_without_refresh`: regression guard for
-    the workspace cache.
+- `include_relative_to_config_not_cwd`: run from a subdirectory with `--cd`.
+- `include_with_explicit_config_flag`: `--config other/cfg.yaml` resolves
+  includes relative to `other/`.
+- `workspace_project_includes_shared_file`: `a/` and `b/` both include
+  `../shared.yaml`, and each gets its own hooks with no collision.
+- `workspace_shared_remote_include_fetched_once`: the server sees one request.
+- `workspace_broken_include_in_unselected_project`: `prek run a/` succeeds while
+  `b/` has a missing include.
+- `editing_local_include_takes_effect_without_refresh`: regression guard for the
+  workspace cache.
 
-Hard errors:
+#### Hard errors
 
-79. `missing_local_include_is_error`.
-80. `include_directory_is_error`.
-81. `self_include_is_error`, and `duplicate_include_is_error`.
-82. `nested_include_is_error`.
-83. `forbidden_key_in_include_is_error`: `default_stages`.
-84. `remote_first_fetch_failure_is_error`: the server is closed. Exit status and
-    the hint are in the snapshot, and no marker file exists.
-85. `remote_first_fetch_http_500_is_error`.
-86. `pinned_mismatch_is_error`: no hook runs.
-87. `collision_include_vs_main_is_error`: no hook runs, including hooks from
-    other projects in the same invocation.
-88. `collision_between_includes_is_error`.
-89. `collision_alias_vs_id_is_error`.
-90. `include_minimum_prek_version_is_error`.
-91. `remote_include_path_repo_is_error`.
-92. `insecure_http_include_is_error`.
+- `missing_local_include_is_error`.
+- `include_directory_is_error`.
+- `self_include_is_error` and `duplicate_include_is_error`.
+- `nested_include_is_error`.
+- `forbidden_key_in_include_is_error`: `default_stages`.
+- `remote_first_fetch_failure_is_error`: the server is closed. Exit status and
+  the hint are in the snapshot, and no marker file exists.
+- `remote_first_fetch_http_500_is_error`.
+- `pinned_mismatch_is_error`: no hook runs.
+- `collision_include_vs_main_is_error`: no hook runs, including hooks from other
+  projects in the same invocation.
+- `collision_between_includes_is_error`.
+- `collision_alias_vs_id_is_error`.
+- `include_minimum_prek_version_is_error`.
+- `remote_include_path_repo_is_error`.
+- `insecure_http_include_is_error`.
 
-Caching:
+#### Hook selection
 
-93. `cached_remote_include_used_while_fresh`: first run fetches, then the server
-    closes, and the second run succeeds with no warning and no request.
-94. `stale_remote_include_falls_back_with_warning`: `PREK_INCLUDE_CACHE_TTL=0`,
-    server closed, a warning, exit success.
-95. `refresh_flag_revalidates`: the request count goes up with `--refresh` and
-    not without it.
-96. `upstream_change_picked_up_after_ttl`: serve v1, then v2 with TTL `0`. The
-    v2 hook runs. Test 184 covers the change warning.
-97. `pinned_include_works_offline_with_refresh`.
-98. `broken_upstream_does_not_poison_cache`: with TTL `0`, after a valid
-    fetch the server returns broken YAML. The run succeeds with the old hooks
-    and a warning that carries the parse error. Then the server serves fixed v2
-    content, and the next run uses v2.
+- `run_selects_and_skips_included_hooks`: `prek run <included-id>`, `--skip`,
+  and `SKIP=`.
+- `manifest_alias_not_a_collision`: a manifest-provided alias that equals an
+  `id` in another source is not an error, and `prek run <name>` selects both
+  hooks, as for a duplicate within one file.
+- `collision_independent_of_selection`: `prek run`, `prek run <unrelated-hook>`,
+  and `prek run --group <group>` report the same collision error for the same
+  config.
 
-Other commands:
+#### Caching and upstream changes
 
-99. `validate_config_with_includes`: valid, collision, missing include, and an
-    unreachable remote include.
-100. `list_shows_included_hooks`: text and JSON output.
-101. `run_selects_and_skips_included_hooks`: `prek run <included-id>`, `--skip`,
-     and `SKIP=`.
-102. `unstaged_local_include_blocks_run`: the include is inside the repo.
-103. `include_outside_repo_not_staged_checked`.
-104. `git_commit_runs_included_hooks`: `prek install`, then `git commit` goes
-     through `hook-impl`.
-105. `prepare_hooks_fails_on_missing_include`: `prek install --prepare-hooks`
-     errors. This is the regression guard for `warn_parse_error` swallowing
-     `NotFound`.
-106. `update_ignores_included_repos`: only main config revs change, the
-     include file is byte-identical afterwards, and the warning naming the local
-     include and its repository count is in the snapshot.
-107. `meta_check_hooks_apply_sees_included_hooks`.
-108. `mutable_rev_warning_names_include_source`.
-109. `unknown_key_warning_names_include_source`.
+- `cached_remote_include_used_while_fresh`: first run fetches, then the server
+  closes, and the second run succeeds with no warning and no request.
+- `stale_remote_include_falls_back_with_warning`: `PREK_INCLUDE_CACHE_TTL=0`,
+  server closed, a warning, exit success.
+- `refresh_flag_revalidates`: the request count goes up with `--refresh` and not
+  without it.
+- `upstream_change_picked_up_after_ttl`: serve v1, then v2 with TTL `0`. The v2
+  hook runs. `unpinned_change_warns` covers the change warning.
+- `unpinned_change_warns`: serve v1, then v2 with TTL `0`. The v2 hook runs, and
+  the change warning with both digests appears once.
+- `pinned_include_works_offline_with_refresh`.
+- `broken_upstream_does_not_poison_cache`: with TTL `0`, after a valid fetch the
+  server returns broken YAML. The run succeeds with the old hooks and a warning
+  that carries the parse error. Then the server serves fixed v2 content, and the
+  next run uses v2.
 
-### Unit tests: Git includes
-
-In `config/include.rs`:
-
-110. `parse_git_include_table`: `repo`, `rev`, and `path` in YAML and TOML.
-111. `reject_git_include_missing_rev`, `reject_git_include_missing_path`, and
-     `reject_rev_without_repo`.
-112. `reject_git_include_with_url`, and `reject_git_include_with_sha256`.
-113. `reject_git_include_special_repo`: `local`, `meta`, and `builtin`.
-114. `relative_include_path_rejects_escape`: `../x.yaml`, `a/../../x.yaml`,
-     `/abs.yaml`, and a Windows drive path. `a/./b.yaml` and `a/../b.yaml` are
-     accepted and normalized.
-115. `git_include_relative_repo_resolves_against_config_dir`.
-116. `reject_duplicate_git_include`: the same `(repo, rev, path)` twice, with
-     `path` spelled differently. The same `(repo, rev)` with two different
-     paths is accepted.
-117. `git_include_rejects_path_repo_inside_included_file`: a relative path, an
-     absolute path, and a `file://` URL.
-118. `collision_git_include_vs_other_sources`: a `GitInclude` source against the
-     main config, a local include, and a remote include.
-119. `mutable_rev_warning_covers_git_include`: the existing heuristic applies
-     to Git include `rev`s, and the warning names the include source. `main` is
-     warned about, and `v1.4.0` and a SHA are not.
-
-In `includes.rs`:
-
-120. `git_includes_cloned_in_one_batch`: two projects and three Git includes
-     over two `(repo, rev)` pairs produce two clones.
-121. `git_include_shares_clone_with_hook_repo`: the same `(repo, rev)` used as a
-     hook repository and as a Git include is cloned once.
-122. `git_include_reads_head_of_shallow_clone`: a Git include at a tag and one
-     at a branch are cloned through the shallow path, where neither name exists
-     as a local ref, and `path` is read from `HEAD`. This guards against using
-     `rev` as the tree-ish.
-
-### Integration tests: Git includes
+#### Git includes
 
 These use the `create_repo` fixture from `tests/common/mod.rs`, which makes a
 local Git repository that works as a `repo:` source, so no server is needed.
 
-123. `git_include_runs_included_hooks`.
-124. `git_include_at_tag_and_sha`: two tags with different content, and each
-     `rev` runs its own hooks.
-125. `git_include_branch_rev_does_not_refresh`: new commits on the branch do not
-     change the hooks, with and without `--refresh`, and the mutable-`rev`
-     warning appears.
-126. `git_include_missing_path_is_error`: no hook runs.
-127. `git_include_path_escape_is_error`.
-128. `git_include_clone_failure_is_error`: a nonexistent repository, and no
-     hook runs.
-129. `git_include_works_offline_when_cloned`: the source repository is deleted
-     after the first run, and the second run succeeds.
-130. `git_include_collision_with_local_include_is_error`.
-131. `git_include_mixed_with_local_and_remote`: the order of the three source
-     kinds is kept.
-132. `workspace_shared_git_include_cloned_once`.
-133. `git_include_relative_repo_path`: `repo: ../shared-config` resolves
-     against the config directory, including with `--config`.
-134. `git_include_toml_file`: TOML chosen by the extension of `path`.
-135. `validate_config_with_git_include`: valid, missing path, and clone
-     failure.
-136. `update_bumps_git_include_rev`: `prek update` moves the include `rev` to
-     the newest tag, and the include file in the source repository is not
-     touched.
+- `git_include_runs_included_hooks`.
+- `git_include_at_tag_and_sha`: two tags with different content, and each `rev`
+  runs its own hooks.
+- `git_include_branch_rev_does_not_refresh`: new commits on the branch do not
+  change the hooks, with and without `--refresh`, and the mutable-`rev` warning
+  appears.
+- `git_include_missing_path_is_error`: no hook runs.
+- `git_include_path_escape_is_error`.
+- `git_include_symlink_file_is_error`: `path` names a symlink committed in the
+  include repository that points outside the clone.
+- `git_include_symlink_parent_is_error`: a parent directory of `path` is a
+  symlink.
+- `git_include_clone_failure_is_error`: a nonexistent repository, and no hook
+  runs.
+- `git_include_works_offline_when_cloned`: the source repository is deleted
+  after the first run, and the second run succeeds.
+- `git_include_collision_with_local_include_is_error`.
+- `git_include_mixed_with_local_and_remote`: the order of the three source kinds
+  is kept.
+- `workspace_shared_git_include_cloned_once`.
+- `git_include_relative_repo_path`: `repo: ../shared-config` resolves against
+  the config directory, including with `--config`.
+- `git_include_toml_file`: TOML chosen by the extension of `path`.
+- `validate_config_with_git_include`: valid, missing path, and clone failure.
 
-### Unit tests: `prek update` and Git includes
+#### Clean-worktree check
 
-In `cli/update/config.rs`:
+- `unstaged_local_include_blocks_run`: the include is inside the repo.
+- `include_outside_repo_not_staged_checked`.
+- `staged_check_symlinked_include`: an unstaged change to the symlink target
+  inside the worktree blocks the run, an unstaged retarget of the symlink blocks
+  the run, and a symlink pointing outside the worktree only checks the link.
+- `untracked_local_include_blocks_run`: a local include created but never added
+  fails the clean-worktree check.
+- `untracked_symlink_include_blocks_run`: an untracked symlink to a tracked
+  include, and a tracked symlink to an untracked file, both fail the check.
 
-137. `yaml_rev_sites_includes_before_repos`: each `rev:` line maps to the right
-     entry.
-138. `yaml_rev_sites_includes_after_repos`.
-139. `yaml_rev_sites_git_includes_only`: no remote repositories.
-140. `yaml_rev_sites_ignore_non_git_includes`: string, local, and remote entries
-     next to one Git include, and only its line counts.
-141. `yaml_flow_style_git_include_skipped`: the result says include revisions
-     can't be updated, and repository revisions are still rewritten.
-142. `yaml_include_rev_keeps_quotes_and_comment`: quote style and a trailing
-     non-frozen comment are kept.
-143. `yaml_include_rev_frozen_comment_spacing`: an existing `# frozen:` spacing
-     is kept, and the default spacing is used for a new one.
-144. `toml_rev_sites_inline_includes`.
-145. `toml_rev_sites_array_of_tables_includes`: `[[includes]]`.
-146. `toml_include_rev_frozen_comment`: an `[[includes]]` table gets the
-     `# frozen:` comment. Under `--freeze`, an inline-table Git include keeps its
-     `rev` and produces the warning, and the output still parses as TOML.
-147. `read_frozen_refs_is_section_aware`: YAML and TOML with `rev` sites in both
-     sections.
+#### Other commands
 
-In `cli/update/source.rs` and `cli/update/repository.rs`:
+- `validate_config_with_includes`: valid, collision, missing include, and an
+  unreachable remote include.
+- `validate_config_holds_store_lock`: `validate-config` with a Git include waits
+  for a store lock held by another process, then succeeds.
+- `validate_config_without_remote_includes_takes_no_lock`: with only local
+  includes, `validate-config` succeeds while another process holds the store
+  lock.
+- `list_shows_included_hooks`: text and JSON output.
+- `git_commit_runs_included_hooks`: `prek install`, then `git commit` goes
+  through `hook-impl`.
+- `prepare_hooks_fails_on_missing_include`: `prek install --prepare-hooks`
+  errors. This is the regression guard for `warn_parse_error` swallowing
+  `NotFound`.
+- `meta_check_hooks_apply_sees_included_hooks`.
+- `meta_hook_resolves_include_of_unselected_config`: `check-hooks-apply`
+  receives a config with a remote include that the surrounding run did not
+  resolve, fetches it, and checks its hooks.
+- `mutable_rev_warning_names_include_source`.
+- `unknown_key_warning_names_include_source`.
 
-148. `hook_repo_and_git_include_share_repo_source`: one `RepoSource` and two
-     targets.
-149. `git_include_uses_repo_update_settings`: `update.repos.<repo>` cooldown and
-     tag filters apply.
-150. `checkout_and_validate_include_missing_path`: the candidate is rejected.
-151. `checkout_and_validate_include_invalid_file`: a forbidden key and a parse
-     error at the candidate tag are rejected.
-152. `checkout_and_validate_include_valid`.
+#### `prek update`
 
-### Integration tests: `prek update` and Git includes
+In `crates/prek/tests/update.rs`, using `create_repo` fixtures with several tags
+and, for HTTPS pins, a local server.
 
-In `crates/prek/tests/update.rs`, using `create_repo` fixtures with several
-tags:
-
-153. `update_git_include_to_latest_tag`: YAML and TOML configs.
-154. `update_git_include_freeze`: writes a SHA and `# frozen: <tag>`.
-155. `update_git_include_cooldown`: a tag inside the cooldown window is skipped,
-     and nothing is downgraded.
-156. `update_git_include_tag_filters`: `--repo-exclude-tag` and project
-     `update.repos` settings.
-157. `update_git_include_repo_selector`: `--repo <include repo>` updates only
-     the include, and `--exclude-repo` skips it.
-158. `update_git_include_bleeding_edge`.
-159. `update_git_include_candidate_missing_path`: the failure is reported, the
-     `rev` is unchanged, and the exit status is failure.
-160. `update_git_include_dry_run`: output snapshot with the include label, and
-     the config is byte-identical afterwards.
-161. `update_hook_repo_and_git_include_same_source`: both are updated in one
-     run, and the source is fetched once.
-162. `update_with_flow_style_git_include`: warning, and repositories are still
-     updated.
-163. `update_workspace_git_includes`: two projects with the same include, each
-     config updated.
-
-### Tests added after review
-
-164. `manifest_alias_not_a_collision` (integration): a manifest-provided alias
-     that equals an `id` in another source is not an error, and
-     `prek run <name>` selects both hooks, as for a duplicate within one file.
-165. `collision_independent_of_selection` (integration): `prek run`,
-     `prek run <unrelated-hook>`, and `prek run --group <group>` report the same
-     collision error for the same config.
-166. `redirect_hop_to_insecure_http_refused` (unit, `includes.rs`): the server
-     redirects to a non-loopback `http` URL, the policy refuses the hop, and no
-     request reaches the target. A hop to a URL with user info is refused too.
-167. `cache_only_skips_missing_entry` (unit, `includes.rs`): a
-     missing remote entry is skipped and reported, and other includes still
-     resolve.
-168. `cache_only_skips_missing_git_clone` (unit, `includes.rs`).
-169. `string_include_classification` (unit, `config/include.rs`): `C:\x.yaml`,
-     `C:/x.yaml`, and `a:b.yaml` are paths, and `file://`, `git+https://`, and
-     `s3://` strings are parse errors.
-170. `cache_gc_repo_sweep_unchanged_when_config_unparsable`
-     (`tests/cache.rs`): while one tracked config fails to parse, the `repos/`
-     sweep runs as today, and the clones referenced by the other configs,
-     including Git include clones, are kept.
-171. `cache_gc_skips_include_sweep_when_config_unparsable` (`tests/cache.rs`):
-     the same for include entries and blobs, with the `--verbose` reason in the
-     snapshot.
-172. `git_include_symlink_file_is_error` (integration): `path` names a symlink
-     committed in the include repository that points outside the clone.
-173. `git_include_symlink_parent_is_error` (integration): a parent directory
-     of `path` is a symlink.
-174. `checkout_and_validate_include_rejects_symlink` (unit): a candidate tag
-     where `path` became a symlink is rejected by `prek update`.
-175. `remote_include_total_timeout` (unit, `includes.rs`): a server that keeps
-     sending one byte at a time fails once the (shortened) total timeout
-     passes, although no single read stalls. With a stale cached entry, the
-     shorter revalidation timeout applies and the result is a `Stale` outcome.
-176. `validate_config_holds_store_lock` (integration): `validate-config` with a
-     Git include waits for a store lock held by another process, then
-     succeeds.
-
-### Tests for HTTPS pin updates and the third review
-
-In `crates/prek/tests/update.rs`, with a local server:
-
-177. `update_https_pin_moves_to_current_content`: YAML, TOML `[[includes]]`,
-     and a TOML inline table. The pin is rewritten, the blob is cached, and the
-     next `prek run` makes no request.
-178. `update_https_pin_up_to_date`: the config is byte-identical and the
-     up-to-date line is in the snapshot.
-179. `update_https_pin_invalid_content_fails`: broken content at the URL fails
-     that include, the pin is unchanged, and the exit status is failure.
-180. `update_https_pin_ignores_unpinned`: an unpinned include is not fetched,
-     and the config is byte-identical.
-181. `update_https_pin_dry_run`: the change is reported, the config is
-     byte-identical, and no blob is written.
-182. `update_https_pin_repo_selector`: `--repo <url>` updates only that pin,
-     and `--exclude-repo <url>` skips it.
-
-Elsewhere:
-
-183. `sha256_sites_map_to_pinned_includes` (unit, `cli/update/config.rs`): YAML
-     and TOML, with unpinned and Git includes in between. A flow-style pinned
-     entry is skipped with the warning.
-184. `unpinned_change_warns` (integration): serve v1, then v2 with TTL `0`. The
-     v2 hook runs, and the change warning with both digests appears once.
-185. `query_string_redacted` (unit, `includes.rs`): a URL with `?token=secret`
-     does not show the token in the stale warning, the fetch error, or the
-     entry JSON, and the cache key still distinguishes two queries.
-186. `redirect_to_loopback_only_from_loopback` (unit, `includes.rs`): a
-     redirect from a non-loopback URL to `http://127.0.0.1` is refused before
-     the request is sent, and a loopback redirect to the same host and port is
-     followed. Test 193 covers the other non-public cases.
-187. `future_fetched_at_is_stale` (unit, `includes.rs`): an entry fetched "in
-     the future" is revalidated.
-188. `meta_hook_resolves_include_of_unselected_config` (integration):
-     `check-hooks-apply` receives a config with a remote include that the
-     surrounding run did not resolve, fetches it, and checks its hooks.
-189. `validate_config_without_remote_includes_takes_no_lock` (integration):
-     with only local includes, `validate-config` succeeds while another process
-     holds the store lock.
-
-### Tests for the fourth review
-
-190. `reject_include_url_fragment` (unit, `config/include.rs`): string and
-     table forms with `#frag` are parse errors, and the error message does not
-     echo the fragment.
-191. `redirect_to_non_public_https_refused` (unit, `includes.rs`): from a
-     public configured URL, hops to `https://127.0.0.1`, `https://10.0.0.1`,
-     `https://169.254.169.254`, `https://[::1]`, `https://[fe80::1]`, and
-     `https://[::ffff:127.0.0.1]` are refused before any request is sent.
-192. `resolver_drops_non_public_addresses` (unit, `includes.rs`): a host name
-     that resolves only to non-public addresses fails to connect for a public
-     configured URL. A name with mixed addresses connects only to the public
-     ones.
-193. `non_public_configured_url_stays_on_host` (unit, `includes.rs`): a
-     loopback configured URL is fetched, a same-host redirect is followed, and a
-     redirect to another host or port is refused.
-194. `classify_destination` (unit, `includes.rs`): table-driven over every range
-     listed in [Remote URL rules](#remote-url-rules), including IPv4-mapped
-     IPv6.
-195. `update_pin_repairs_missing_blob` (unit, `cli/update/`): with an unchanged
-     digest and a deleted or corrupted blob, `prek update` reports up to date
-     and the blob exists and verifies afterwards. `--dry-run` still writes
-     nothing.
-196. `staged_check_symlinked_include` (integration): an unstaged change to the
-     symlink target inside the worktree blocks the run, an unstaged retarget of
-     the symlink blocks the run, and a symlink pointing outside the worktree
-     only checks the link.
-197. `update_yaml_anchor_rev_without_includes` (integration): a config whose
-     only `rev` comes from a merged anchor is updated exactly as today.
-198. `update_yaml_anchor_with_git_include_is_error` (integration): the same
-     config plus a Git include fails for that file with the anchor error, and a
-     second project in the workspace is still updated.
-199. `yaml_anchor_detection_ignores_strings` (unit, `cli/update/config.rs`):
-     `&` and `*` inside quoted values and comments are not treated as anchors.
-
-### Tests for the fifth review
-
-200. `private_network_requires_opt_in` (unit, `includes.rs`): a host name that
-     resolves only to `10.0.0.1` fails to connect without `private_network`,
-     and is fetched with it. `private_network` with `path` or `repo`, or on an
-     IP literal or `localhost` URL, is a parse error.
-201. `rebinding_after_first_fetch_refused` (unit, `includes.rs`): a host name
-     that resolves to a public address on the first fetch and to `127.0.0.1`
-     on revalidation is refused on revalidation, and the stale fallback
-     applies.
-202. `outer_deadline_covers_dns` (unit, `includes.rs`): a resolver that never
-     answers makes the fetch fail at the (shortened) total deadline.
-203. `loopback_http_redirect_same_port_only` (unit, `includes.rs`): from a
-     loopback `http` URL, a redirect to the same host and port is followed, and
-     a redirect to plain `http` on another port is refused. From a public
-     `https` URL, any `http` hop is refused.
-204. `untracked_local_include_blocks_run` (integration): a local include created
-     but never added fails the clean-worktree check.
-205. `untracked_symlink_include_blocks_run` (integration): an untracked symlink
-     to a tracked include, and a tracked symlink to an untracked file, both fail
-     the check.
-206. `fetch_dedup_keys_on_trust_class` (unit, `includes.rs`): two projects
-     include the same URL, one with `private_network = true` and one without.
-     Each is fetched with its own client, the project without the opt-in fails
-     on a private address whatever the resolution order, and two projects with
-     the same trust class share one request.
+- `update_ignores_included_repos`: only main config revs change, the include
+  file is byte-identical afterwards, and the warning naming the local include
+  and its repository count is in the snapshot.
+- `update_bumps_git_include_rev`: `prek update` moves the include `rev` to the
+  newest tag, and the include file in the source repository is not touched.
+- `update_git_include_to_latest_tag`: YAML and TOML configs.
+- `update_git_include_freeze`: writes a SHA and `# frozen: <tag>`.
+- `update_git_include_cooldown`: a tag inside the cooldown window is skipped,
+  and nothing is downgraded.
+- `update_git_include_tag_filters`: `--repo-exclude-tag` and project
+  `update.repos` settings.
+- `update_git_include_repo_selector`: `--repo <include repo>` updates only the
+  include, and `--exclude-repo` skips it.
+- `update_git_include_bleeding_edge`.
+- `update_git_include_candidate_missing_path`: the failure is reported, the
+  `rev` is unchanged, and the exit status is failure.
+- `update_git_include_dry_run`: output snapshot with the include label, and the
+  config is byte-identical afterwards.
+- `update_hook_repo_and_git_include_same_source`: both are updated in one run,
+  and the source is fetched once.
+- `update_with_flow_style_git_include`: warning, and repositories are still
+  updated.
+- `update_workspace_git_includes`: two projects with the same include, each
+  config updated.
+- `update_yaml_anchor_rev_without_includes`: a config whose only `rev` comes
+  from a merged anchor is updated exactly as today.
+- `update_yaml_anchor_with_git_include_is_error`: the same config plus a Git
+  include fails for that file with the anchor error, and a second project in the
+  workspace is still updated.
+- `update_https_pin_moves_to_current_content`: YAML, TOML `[[includes]]`, and a
+  TOML inline table. The pin is rewritten, the blob is cached, and the next
+  `prek run` makes no request.
+- `update_https_pin_up_to_date`: the config is byte-identical and the up-to-date
+  line is in the snapshot.
+- `update_https_pin_invalid_content_fails`: broken content at the URL fails that
+  include, the pin is unchanged, and the exit status is failure.
+- `update_https_pin_ignores_unpinned`: an unpinned include is not fetched, and
+  the config is byte-identical.
+- `update_https_pin_dry_run`: the change is reported, the config is
+  byte-identical, and no blob is written.
+- `update_https_pin_repo_selector`: `--repo <url>` updates only that pin, and
+  `--exclude-repo <url>` skips it.
 
 Additions to existing test files:
 
@@ -1775,8 +1795,11 @@ Additions to existing test files:
   removed from the config), `cache_gc_keeps_pinned_blob`,
   `cache_gc_keeps_repos_referenced_by_includes`,
   `cache_gc_keeps_git_include_clone`,
-  `cache_gc_removes_git_include_clone_after_removal`, and a
-  `--dry-run --verbose` output snapshot.
+  `cache_gc_removes_git_include_clone_after_removal`, `cache_gc_repo_sweep_unchanged_when_config_unparsable` (while one
+  tracked config fails to parse, the `repos/` sweep runs as today and clones
+  referenced by the other configs are kept), `cache_gc_skips_include_sweep_when_config_unparsable` (the same for
+  include entries and blobs, with the `--verbose` reason in the snapshot), and
+  a `--dry-run --verbose` output snapshot.
 - `tests/yaml_to_toml.rs`: `yaml_to_toml_converts_includes`, covering string
   entries, table entries with `sha256` or `private_network`, and Git include
   tables.
@@ -1791,36 +1814,36 @@ These guard existing behavior, and each maps to a risk this change introduces:
 
 | Risk | Guard |
 | -- | -- |
-| Configs without includes change behavior | Existing suites pass unchanged, apart from the regenerated `Config` debug snapshots in test 16. |
-| Network access without includes | Test 42's zero-request harness, plus a run with a closed server and no includes. |
-| `pre-commit` duplicate hook lists break | Test 38, plus an integration run with the same hook twice in one file. |
-| Priority aliases resolve against the wrong table | Tests 25 and 72. |
-| Missing include swallowed as "no config" | Test 105. |
-| Workspace cache hides include edits | Test 78. |
-| Silent pin loss from typos | Test 10. |
-| A broken upstream file blocks commits, or is hidden | Tests 54 and 98. |
-| `prek update` writes to the wrong file | Tests 106 and 136. |
-| A Git include breaks `prek update` rev mapping | Tests 137 to 141, 147, and 162. |
+| Configs without includes change behavior | Existing suites pass unchanged, apart from the `Config` debug snapshots regenerated with `config_without_includes_defaults_empty`. |
+| Network access without includes | `fresh_entry_makes_no_request`'s zero-request harness, plus a run with a closed server and no includes. |
+| `pre-commit` duplicate hook lists break | `duplicate_within_one_source_allowed`, plus an integration run with the same hook twice in one file. |
+| Priority aliases resolve against the wrong table | `included_priority_alias_scoped_to_file` and `include_priorities_schedule_across_sources`. |
+| Missing include swallowed as "no config" | `prepare_hooks_fails_on_missing_include`. |
+| Workspace cache hides include edits | `editing_local_include_takes_effect_without_refresh`. |
+| Silent pin loss from typos | `reject_include_unknown_table_key`. |
+| A broken upstream file blocks commits, or is hidden | `invalid_content_not_cached` and `broken_upstream_does_not_poison_cache`. |
+| `prek update` writes to the wrong file | `update_ignores_included_repos` and `update_bumps_git_include_rev`. |
+| A Git include breaks `prek update` rev mapping | `yaml_rev_sites_includes_before_repos`, `yaml_rev_sites_includes_after_repos`, `yaml_rev_sites_git_includes_only`, `yaml_rev_sites_ignore_non_git_includes`, `yaml_flow_style_git_include_skipped`, `read_frozen_refs_is_section_aware`, and `update_with_flow_style_git_include`. |
 | `prek update` output changes for configs without includes | Existing `tests/update.rs` snapshots pass unchanged. |
-| `prek update` modifies local include files | Test 106, plus a byte-for-byte check in test 153. |
+| `prek update` modifies local include files | `update_ignores_included_repos`, plus a byte-for-byte check in `update_git_include_to_latest_tag`. |
 | GC deletes caches still in use | The `tests/cache.rs` additions. |
-| Git include reads files outside its checkout | Tests 114 and 127. |
-| Collision errors depend on hook selection | Tests 164 and 165. |
-| A Git include reads outside the clone through a symlink | Tests 172 to 174. |
-| GC deletes include caches of a config it cannot parse, or changes the `repos/` sweep | Tests 170 and 171. |
-| Git include reads fail for tag and branch revs | Test 122. |
-| `--freeze` corrupts TOML inline tables | Test 146. |
-| A remote include reaches services on the user's machine or network | Tests 191 to 194. |
-| Configs using YAML anchors stop updating | Test 197. |
-| An unstaged symlink change bypasses the clean-worktree check | Test 196. |
-| An untracked local include bypasses the clean-worktree check | Tests 204 and 205. |
-| DNS answers change a remote include's trust class | Tests 200 and 201. |
-| One project's `private_network` opt-in applies to another project | Test 206. |
-| A stalled resolver blocks a commit | Test 202. |
-| Unpinned content changes hooks silently | Tests 96 and 184. |
-| Tokens in include URLs leak into messages | Test 185. |
-| `validate-config` needs the store without remote includes | Test 189. |
-| Git includes change hook repository clone behavior | Tests 121 and 132, plus the existing clone and `try-repo` suites passing unchanged. |
+| Git include reads files outside its checkout | `relative_include_path_rejects_escape` and `git_include_path_escape_is_error`. |
+| Collision errors depend on hook selection | `manifest_alias_not_a_collision` and `collision_independent_of_selection`. |
+| A Git include reads outside the clone through a symlink | `git_include_symlink_file_is_error`, `git_include_symlink_parent_is_error`, and `checkout_and_validate_include_rejects_symlink`. |
+| GC deletes include caches of a config it cannot parse, or changes the `repos/` sweep | `cache_gc_repo_sweep_unchanged_when_config_unparsable` and `cache_gc_skips_include_sweep_when_config_unparsable`. |
+| Git include reads fail for tag and branch revs | `git_include_reads_head_of_shallow_clone`. |
+| `--freeze` corrupts TOML inline tables | `toml_include_rev_frozen_comment`. |
+| A remote include reaches services on the user's machine or network | `redirect_to_non_public_https_refused`, `resolver_drops_non_public_addresses`, `non_public_configured_url_stays_on_host`, and `classify_destination`. |
+| Configs using YAML anchors stop updating | `update_yaml_anchor_rev_without_includes`. |
+| An unstaged symlink change bypasses the clean-worktree check | `staged_check_symlinked_include`. |
+| An untracked local include bypasses the clean-worktree check | `untracked_local_include_blocks_run` and `untracked_symlink_include_blocks_run`. |
+| DNS answers change a remote include's trust class | `private_network_requires_opt_in` and `rebinding_after_first_fetch_refused`. |
+| One project's `private_network` opt-in applies to another project | `fetch_dedup_keys_on_trust_class`. |
+| A stalled resolver blocks a commit | `outer_deadline_covers_dns`. |
+| Unpinned content changes hooks silently | `upstream_change_picked_up_after_ttl` and `unpinned_change_warns`. |
+| Tokens in include URLs leak into messages | `query_string_redacted`. |
+| `validate-config` needs the store without remote includes | `validate_config_without_remote_includes_takes_no_lock`. |
+| Git includes change hook repository clone behavior | `git_include_shares_clone_with_hook_repo` and `workspace_shared_git_include_cloned_once`, plus the existing clone and `try-repo` suites passing unchanged. |
 
 ## Delivery plan
 
@@ -1853,8 +1876,13 @@ visible difference is that configs with `rev:` lines under other top-level
 keys, such as an `x-` key holding YAML anchors, stop failing with a count
 mismatch, because those lines no longer count as repository sites.
 
-- Tests: 137 to 147, 197, and 199. The rewriting functions work on file text, so these tests
-  do not need `includes` parsing.
+- Tests:
+  - the unit group "`prek update` rewriting", except
+    `sha256_sites_map_to_pinned_includes`,
+  - `update_yaml_anchor_rev_without_includes` from the integration group
+    "`prek update`",
+  - none of these need `includes` parsing, because the rewriting functions work
+    on file text.
 - Guard: every existing `tests/update.rs` snapshot stays byte-identical.
 
 ### PR 2: `includes` and local includes
@@ -1875,17 +1903,35 @@ mismatch, because those lines no longer count as repository sites.
 - The `prek.schema.json` update and the reference, compatibility, and cookbook
   docs for local includes.
 - Tests:
-  - unit tests 1 to 40 and 110 to 117,
-  - integration tests 63, 64, 66, 68, 69, 71 to 75, 77 to 83, 87 to 90, 92,
-    and 100 to 109,
-  - the local parts of 99,
+  - the unit group "Include entry parsing",
+  - the unit group "Duplicate and self includes",
+  - the unit group "Included file validation", except
+    `mutable_rev_warning_covers_git_include`,
+  - the unit group "Hook collisions", except
+    `collision_git_include_vs_other_sources`,
+  - the integration group "Basic behavior", except
+    `mixed_local_and_remote_includes`, `remote_toml_include_by_extension`, and
+    `remote_include_with_remote_repo`,
+  - the integration group "Paths and workspace", except
+    `workspace_shared_remote_include_fetched_once`,
+  - the integration group "Hard errors", except
+    `remote_first_fetch_failure_is_error`,
+    `remote_first_fetch_http_500_is_error`, `pinned_mismatch_is_error`, and
+    `remote_include_path_repo_is_error`,
+  - the integration group "Hook selection",
+  - the integration group "Clean-worktree check",
+  - the integration group "Other commands", except
+    `validate_config_holds_store_lock`,
+    `validate_config_without_remote_includes_takes_no_lock`, and
+    `meta_hook_resolves_include_of_unselected_config`
+    (`validate_config_with_includes` only for its local parts),
+  - `update_ignores_included_repos` from the integration group "`prek update`",
   - a temporary `unsupported_include_source_is_error` test, which PRs 3 and 5
     replace with their positive tests,
   - `yaml_to_toml_converts_includes`, and the local part of
-    `completion_offers_included_hook_ids`,
-  - review follow-ups 164, 165, 169, 190, 196, 204, and 205.
+    `completion_offers_included_hook_ids`.
 - Scope note: the `prek update` warning for repositories in local includes
-  lands here, with test 106.
+  lands here, with `update_ignores_included_repos`.
 
 ### PR 3: Git includes
 
@@ -1896,12 +1942,19 @@ mismatch, because those lines no longer count as repository sites.
   configs with Git includes. PR 3 is the first PR in which validation writes to
   the store.
 - Tests:
-  - unit tests 118 to 122,
-  - integration tests 123 to 135,
+  - `mutable_rev_warning_covers_git_include` from the unit group "Included file
+    validation",
+  - `collision_git_include_vs_other_sources` from the unit group "Hook
+    collisions",
+  - the unit group "Git include resolution",
+  - the integration group "Git includes",
+  - `validate_config_holds_store_lock` and
+    `validate_config_without_remote_includes_takes_no_lock` from the integration
+    group "Other commands",
+  - `cache_gc_repo_sweep_unchanged_when_config_unparsable` in `tests/cache.rs`,
   - `cache_gc_keeps_git_include_clone` and
     `cache_gc_removes_git_include_clone_after_removal`,
   - the Git part of `completion_offers_included_hook_ids`,
-  - review follow-ups 168, 170, 172, 173, 176, and 189,
   - the regression rows for checkout escapes and hook repository clones.
 
 ### PR 4: `prek update` for Git includes
@@ -1910,7 +1963,15 @@ mismatch, because those lines no longer count as repository sites.
   `UpdateRequirement`, `checkout_and_validate_include`, Git include targets,
   repository selectors, and output labels. The rewriting side is already in
   place from PR 1.
-- Tests: 136, 148 to 163, 174, and 198.
+- Tests:
+  - the unit group "`prek update` targets and validation", except
+    `update_pin_repairs_missing_blob`,
+  - the integration group "`prek update`", except
+    `update_ignores_included_repos`, `update_yaml_anchor_rev_without_includes`,
+    `update_https_pin_moves_to_current_content`, `update_https_pin_up_to_date`,
+    `update_https_pin_invalid_content_fails`,
+    `update_https_pin_ignores_unpinned`, `update_https_pin_dry_run`, and
+    `update_https_pin_repo_selector`.
 
 ### PR 5: HTTPS includes
 
@@ -1920,20 +1981,43 @@ mismatch, because those lines no longer count as repository sites.
   for include entries and blobs, and the HTTPS parts of the security docs.
 - The `TestHttpServer` helper in `tests/common/mod.rs`.
 - Tests:
-  - unit tests 41 to 62,
-  - integration tests 65, 67, 70, 76, 84 to 86, 91, and 93 to 98,
-  - the remote parts of 99,
+  - the unit group "Remote cache and freshness",
+  - the unit group "Remote pinning",
+  - the unit group "Remote fetch failures and limits",
+  - the unit group "Redirects and private networks",
+  - the unit group "Fetch deduplication",
+  - `mixed_local_and_remote_includes`, `remote_toml_include_by_extension`, and
+    `remote_include_with_remote_repo` from the integration group "Basic
+    behavior",
+  - `workspace_shared_remote_include_fetched_once` from the integration group
+    "Paths and workspace",
+  - `remote_first_fetch_failure_is_error`,
+    `remote_first_fetch_http_500_is_error`, `pinned_mismatch_is_error`, and
+    `remote_include_path_repo_is_error` from the integration group "Hard
+    errors",
+  - the integration group "Caching and upstream changes",
+  - `validate_config_with_includes` and
+    `meta_hook_resolves_include_of_unselected_config` from the integration group
+    "Other commands" (`validate_config_with_includes` only for its remote
+    parts),
+  - `cache_gc_skips_include_sweep_when_config_unparsable` in `tests/cache.rs`,
   - the include-cache tests in `tests/cache.rs`, and the remote part of
-    `completion_offers_included_hook_ids`,
-  - review follow-ups 166, 167, 171, 175, 184 to 188, 191 to 194, 200 to
-    203, and 206.
+    `completion_offers_included_hook_ids`.
 
 ### PR 6: `prek update` for HTTPS pins
 
 - [`prek update` and HTTPS pins](#prek-update-and-https-pins): the
   `update_include_pins` step, `sha256` site mapping, the `pins` field of
   `ConfigRevisions`, selectors, and output lines.
-- Tests: 177 to 183, and 195.
+- Tests:
+  - `sha256_sites_map_to_pinned_includes` from the unit group "`prek update`
+    rewriting",
+  - `update_pin_repairs_missing_blob` from the unit group "`prek update` targets
+    and validation",
+  - `update_https_pin_moves_to_current_content`, `update_https_pin_up_to_date`,
+    `update_https_pin_invalid_content_fails`,
+    `update_https_pin_ignores_unpinned`, `update_https_pin_dry_run`, and
+    `update_https_pin_repo_selector` from the integration group "`prek update`".
 
 ### Releases between PRs
 
@@ -1977,26 +2061,3 @@ early with the version message instead.
 - A setting that requires every remote include to be pinned.
 - Include sources in `prek list --output-format=json`.
 - Nested includes, with cycle detection.
-
-## Open questions
-
-- **TTL default.** One hour matches the workspace cache and keeps commits
-  offline-friendly. A longer default reduces request volume for large teams,
-  and a shorter one propagates upstream changes faster.
-- **Forbidden keys versus warnings.** This spec rejects project-level keys in
-  included files. Warning and ignoring them would let people include a full
-  existing `.pre-commit-config.yaml`, as the example in the issue does, at the
-  cost of silently different behavior.
-- **Relative repository paths inside Git includes.** This spec rejects them.
-  Resolving them against the checkout would allow hook repositories vendored
-  next to the shared config, but it would make a store path part of the
-  configuration.
-- **Hook order.** Includes before main follows reading order. Main-first would
-  let project hooks such as formatters run before shared checks without
-  explicit priorities, and would keep the implicit priorities of main-config
-  hooks stable when an include changes, at the cost of shifting the included
-  hooks instead.
-- **Invalid upstream content.** This spec falls back to the cached copy with a
-  warning, which keeps commits working but lets a broken shared file go
-  unnoticed by anyone who ignores warnings. The alternative is a hard error,
-  which makes an upstream typo an outage for every consumer.
