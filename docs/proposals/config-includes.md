@@ -138,7 +138,7 @@ A table has one of three shapes:
 | Shape | Keys | Meaning |
 | -- | -- | -- |
 | Local | `path` | Local file path. |
-| Remote | `url`, optional `sha256` | HTTPS URL, optionally pinned to the SHA-256 of the file's bytes. |
+| Remote | `url`, optional `sha256`, optional `private_network` | HTTPS URL, optionally pinned to the SHA-256 of the file's bytes. `private_network = true` opts a host name into private-network access, see [Remote URL rules](#remote-url-rules). |
 | Git | `repo`, `rev`, `path` | File at `path` inside the Git repository `repo` at revision `rev`. |
 
 The shape is decided by the keys present: `url` means remote, `repo` means Git,
@@ -157,6 +157,7 @@ Table rules, all enforced during parsing so errors carry a line and column:
   moved by the repository maintainer, and branches do not pin anything. Use a
   commit SHA, for example via `prek update --freeze`, when you need integrity
   for a Git include. See [Freshness and pinning](#freshness-and-pinning).
+- `private_network` is only valid with `url`, and must be a boolean.
 - Unknown keys in an include table are an error, not a warning. A typo like
   `sha265` would otherwise disable pinning without any visible sign.
 - `sha256` accepts 64 hex characters, case-insensitive, with an optional
@@ -187,18 +188,39 @@ Table rules, all enforced during parsing so errors carry a line and column:
   policy is a property of the client, not of a request, so remote includes use
   a dedicated client. It is built with the same settings as
   `http::REQWEST_CLIENT` (TLS backend, custom certificates, proxy), plus a
-  `reqwest::redirect::Policy::custom` that refuses a hop to plain `http`, and a
-  hop to a URL with user info or a fragment, and keeps the default limit of 10
-  hops. Checking only `response.url()` would be too late, because the request
-  would already have been sent. The final URL is checked again after the
-  response as a second guard.
+  `reqwest::redirect::Policy::custom` and keeps the default limit of 10 hops.
+  The policy is the single place where hop rules live. A hop is refused when:
+  - its URL has user info or a fragment;
+  - its scheme is plain `http`, unless the configured URL is itself a loopback
+    `http` URL and the hop keeps the same host and port, which local
+    development servers and the test suite rely on;
+  - the configured URL is public and the hop's host is a non-public IP literal
+    or `localhost` (see the classification below);
+  - the configured URL is non-public and the hop changes host or port.
+
+  Checking only `response.url()` would be too late, because the request would
+  already have been sent. The final URL is checked again after the response as
+  a second guard.
 - A remote host must not be able to point `prek` at services on the user's
   machine or network, whatever the scheme. Every destination is classified as
   **public** or **non-public**. Non-public means loopback (`127.0.0.0/8`,
   `::1`, `localhost`), private (`10.0.0.0/8`, `172.16.0.0/12`,
   `192.168.0.0/16`, `fc00::/7`), link-local (`169.254.0.0/16`, `fe80::/10`),
   carrier-grade NAT (`100.64.0.0/10`), unspecified, multicast, broadcast, and
-  IPv4-mapped IPv6 forms of these. The configured URL decides what is allowed:
+  IPv4-mapped IPv6 forms of these. The configured URL is classified without
+  DNS, so a DNS answer can never change its trust class:
+  - an IP literal is classified by its range;
+  - `localhost` is non-public;
+  - every other host name is public, unless its include entry sets
+    `private_network = true`. That opt-in is how an intranet include behind a
+    host name, for example `https://config.corp.example/base.yaml`, is
+    allowed. It is written in the main config, so it is reviewed like the rest
+    of the project configuration.
+
+  Classifying a host name from its current DNS answer instead would reopen DNS
+  rebinding: a public name that later resolves only to a private address would
+  be classified non-public and handed the unrestricted client. The
+  classification then decides what is allowed:
   - If the configured host is public, every hop and every connection must be
     public. The redirect policy refuses a hop whose host is a non-public IP
     literal or `localhost`. Host names are checked where they are resolved: the
@@ -210,9 +232,8 @@ Table rules, all enforced during parsing so errors carry a line and column:
     local development server, the include may be fetched, but redirects must
     stay on the same host and port. A non-public include cannot hop to another
     internal service.
-  - The configured host is classified once, by resolving it before the first
-    request. The two cases use two lazily built clients that share every other
-    setting.
+  - The two cases use two lazily built clients that share every other
+    setting. No DNS resolution happens before the request.
   - When an HTTP or HTTPS proxy is configured, the proxy resolves host names,
     so the resolver filter cannot see the final address. The redirect-policy
     checks on IP literals and `localhost` still apply, and the reference docs
@@ -478,8 +499,11 @@ are stable.
   `http::REQWEST_CLIENT`, so proxy settings, `PREK_NATIVE_TLS`,
   `SSL_CERT_FILE`, and `SSL_CERT_DIR` behave as they do for other downloads,
   along with the shared 30 second connect and read (inactivity) timeouts.
-- Each request also sets a total timeout with `RequestBuilder::timeout`, which
-  covers connecting as well. The shared read timeout only fires when no bytes
+- The whole fetch, from DNS resolution through redirects and streaming the
+  body, runs inside `tokio::time::timeout`, so a stalled resolver or a slow
+  redirect chain cannot outlive the deadline. Each request also sets the same
+  value with `RequestBuilder::timeout` as an inner bound, which covers
+  connecting as well. The shared read timeout only fires when no bytes
   arrive, so a server that keeps trickling data could otherwise hold a commit
   indefinitely. The total timeout is 30 seconds when there is no usable cached
   copy, and 5 seconds when revalidating a stale entry. Revalidation sits on the
@@ -879,6 +903,15 @@ added to that check, because an unstaged include changes which hooks run just as
 an unstaged main config would. Local includes outside the worktree, remote
 includes, and Git includes are not checked. The check uses the parsed
 `includes` paths and does not need network resolution.
+
+`git::files_not_staged` (`crates/prek/src/git.rs`) only runs `git diff`, which
+does not report untracked files. A new local include that was never added
+would therefore pass, while its hooks run and the file is missing from the
+commit. Include paths are also checked with a new `git::files_not_in_index`
+helper (`git ls-files -z -- <paths>`, compared against the input), and an
+untracked include fails with the same "not staged" error. Main config files
+have the same gap today; the helper can cover them too, and that is noted as a
+separate fix rather than folded into this proposal.
 
 A local include may be a symlink, or sit under a symlinked directory. Checking
 only the path as written would miss unstaged edits to the target, and checking
@@ -1693,6 +1726,28 @@ Elsewhere:
 199. `yaml_anchor_detection_ignores_strings` (unit, `cli/update/config.rs`):
      `&` and `*` inside quoted values and comments are not treated as anchors.
 
+### Tests for the fifth review
+
+200. `private_network_requires_opt_in` (unit, `includes.rs`): a host name that
+     resolves only to `10.0.0.1` fails to connect without `private_network`,
+     and is fetched with it. `private_network` with `path` or `repo` is a parse
+     error.
+201. `rebinding_after_first_fetch_refused` (unit, `includes.rs`): a host name
+     that resolves to a public address on the first fetch and to `127.0.0.1`
+     on revalidation is refused on revalidation, and the stale fallback
+     applies.
+202. `outer_deadline_covers_dns` (unit, `includes.rs`): a resolver that never
+     answers makes the fetch fail at the (shortened) total deadline.
+203. `loopback_http_redirect_same_port_only` (unit, `includes.rs`): from a
+     loopback `http` URL, a redirect to the same host and port is followed, and
+     a redirect to plain `http` on another port is refused. From a public
+     `https` URL, any `http` hop is refused.
+204. `untracked_local_include_blocks_run` (integration): a local include created
+     but never added fails the clean-worktree check.
+205. `untracked_symlink_include_blocks_run` (integration): an untracked symlink
+     to a tracked include, and a tracked symlink to an untracked file, both fail
+     the check.
+
 Additions to existing test files:
 
 - `tests/cache.rs`: `cache_gc_keeps_referenced_include_entries`,
@@ -1737,6 +1792,9 @@ These guard existing behavior, and each maps to a risk this change introduces:
 | A remote include reaches services on the user's machine or network | Tests 191 to 194. |
 | Configs using YAML anchors stop updating | Test 197. |
 | An unstaged symlink change bypasses the clean-worktree check | Test 196. |
+| An untracked local include bypasses the clean-worktree check | Tests 204 and 205. |
+| DNS answers change a remote include's trust class | Tests 200 and 201. |
+| A stalled resolver blocks a commit | Test 202. |
 | Unpinned content changes hooks silently | Tests 96 and 184. |
 | Tokens in include URLs leak into messages | Test 185. |
 | `validate-config` needs the store without remote includes | Test 189. |
@@ -1803,7 +1861,7 @@ mismatch, because those lines no longer count as repository sites.
     replace with their positive tests,
   - `yaml_to_toml_converts_includes`, and the local part of
     `completion_offers_included_hook_ids`,
-  - review follow-ups 164, 165, 169, 190, and 196.
+  - review follow-ups 164, 165, 169, 190, 196, 204, and 205.
 - Scope note: the `prek update` warning for repositories in local includes
   lands here, with test 106.
 
@@ -1845,7 +1903,8 @@ mismatch, because those lines no longer count as repository sites.
   - the remote parts of 99,
   - the include-cache tests in `tests/cache.rs`, and the remote part of
     `completion_offers_included_hook_ids`,
-  - review follow-ups 166, 167, 171, 175, 184 to 188, and 191 to 194.
+  - review follow-ups 166, 167, 171, 175, 184 to 188, 191 to 194, and 200 to
+    203.
 
 ### PR 6: `prek update` for HTTPS pins
 
